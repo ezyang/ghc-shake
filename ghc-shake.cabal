@@ -22,9 +22,7 @@ library
   build-depends:       base,
                        ghc == 7.10.*,
                        shake,
-                       binary,
-                       hashable,
-                       deepseq,
+                       containers,
                        filepath
   -- hs-source-dirs:      
   default-language:    Haskell2010

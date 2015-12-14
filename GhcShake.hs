@@ -15,18 +15,19 @@ import SysTools ( newTempName )
 import StringBuffer ( hGetStringBuffer )
 import HeaderInfo ( getImports )
 import PrelNames ( gHC_PRIM )
+import Maybes ( expectJust )
 
 import Development.Shake
 import Development.Shake.Rule
+import Development.Shake.Classes
 
-import GHC.Generics (Generic)
+import qualified Data.Map as Map
+import Data.Map (Map)
 import Data.Typeable
-import Data.Binary
-import Data.Hashable
 import Data.List
 import Data.Maybe
 import Control.Monad
-import Control.DeepSeq
+import Control.Concurrent.MVar
 import Control.Exception
 import System.Environment
 import System.FilePath
@@ -49,52 +50,17 @@ doShake args srcs = do
     setSessionDynFlags
         (dflags0 { ghcMode = CompManager,
                    ghcLink = LinkBinary })
-    dflags <- getDynFlags
 
+    -- These will end up being our top-level wants
     let (hs_srcs, non_hs_srcs) = partition haskellish srcs
     targets <- mapM (uncurry guessTarget) hs_srcs
 
-    {-
-    locations <- mapM getTargetLocation targets
-
-    hs_o_files <- mapM get_o_file targets
-    hs_hi_files <- mapM get_hi_file targets
-    -- TODO: compute hs_hi_files
-    let hs_out_files = hs_o_files ++ hs_hi_files
-    -}
-    let hs_out_files = undefined
-
+    dflags <- getDynFlags
     hsc_env <- getSession
     liftIO $ do
 
-    -- If you want to build a .o file, it is ambiguous whether or not it
-    -- is a Haskell or C file.  For example:
-    --
-    --      ghc --make A.c A.hs
-    --
-    -- will clobber A.o (GHC's build system does no sanity check here.)
-    -- However, we observe that GHC will never go off and build a
-    -- non-Haskell source manually; it has to be in non_hs_srcs.  So
-    -- for EACH non_hs_srcs, we add a rule for how to build its product,
-    -- with higher priority than the default Haskell rule, and leave
-    -- it at that.  To do that, we have to precompute the output
-    -- filenames of each non_hs_src file.
-    non_hs_o_files <- forM non_hs_srcs $ \(input_fn, mb_phase) -> do
-        -- This code duplicates compileFile hsc_env StopLn x
-        let mb_o_file = outputFile dflags
-            -- Some of these cases should be impossible
-            output
-             -- ToDo: kill this
-             | HscNothing <- hscTarget dflags = Temporary
-             | not (isNoLink (ghcLink dflags)) = Persistent
-             -- ToDo: kill this too
-             | isJust mb_o_file = SpecificFile
-             | otherwise = Persistent
-            (basename, _) = splitExtension input_fn
-            stopPhase = StopLn
-        output_fn <-
-            getOutputFilename stopPhase output basename dflags stopPhase Nothing
-        return ((input_fn, mb_phase), output_fn)
+    -- HPT cache
+    hpt_cache <- newMVar Map.empty
 
     withArgs args $ do
     shakeArgs shakeOptions {
@@ -113,77 +79,76 @@ doShake args srcs = do
                         then Just AssumeDirty
                         else Nothing
     } $ do
-    -- Non-Haskell files:
-    want (map snd non_hs_o_files)
-    forM non_hs_o_files $ \((input_fn, mb_phase), output_fn) -> do
-        output_fn %> \output_fn2 -> do
-            need [input_fn]
-            output_fn3 <- liftIO $ compileFile hsc_env StopLn (input_fn, mb_phase)
-            -- TODO: assert all output_fns are the same
-            assert (output_fn == output_fn2 &&
-                    output_fn == output_fn3) $ return ()
-            -- TODO: read out dependencies from C compiler
 
-    -- Haskell files:
-    -- For the targets: want to summariseModule/summariseFile, but only enough
-    -- to determine end location.  I.e., run the finder, and that will tell us
-    -- what the output location is supposed to be.  BUT we only need to do
-    -- this if we're placing o/hi files at the original source locations;
-    -- if not we actually know the correct location a priori.
-    -- want hs_out_files
+    -- Want to build every target a user specified on the command line.
+    wantTargets (map targetKey targets)
 
-    -- For the rules, we must REVERSE ENGINEER the module name from the output
-    -- file path.  Canonical code responsible for determining where the output
-    -- files go is findHomeModule/specifcally mkHomeModLocationSearched.  We'll
-    -- need to reimplement this.
+    -- Reimplemented FinderCache with dependency tracking.
+    finder <- newCache (findHomeModule dflags)
+
+    rule $ \(TargetKey k) -> case k of
+        Left mod_name -> Just $ do
+            -- No point avoiding probing for the source, because we're
+            -- going to need it shortly to build the damn thing
+            r <- finder mod_name
+            case r of
+                -- TODO: -fno-code, should not request object file
+                -- TODO: maybe should request source file too?
+                Found loc _ -> need [ ml_hi_file loc, ml_obj_file loc ]
+                _ -> error ("Could not find module " ++ mod_name)
+            return (TargetVal ()) -- Hmmm
+        Right file -> Just $ do
+            error "Can't handle file targets yet"
+            return (TargetVal ())
+
+    -- Haskell rules, the plan:
+    --  1. From the output file name, find the source file
+    --      - If -outputdir is being used, this is done by
+    --        reverse engineering the intended ModuleName and then
+    --        probing -i for the source file.
+    --          - TODO: With a special case for file targets, which
+    --            are non -i places where the source file may be.
+    --            I don't know how to handle this correctly yet.
+    --      - If not, the source file is colocated with the
+    --        output file.
+    --  2. Parse the source file until you get to dependencies,
+    --     and require those
+    --  3. Build it!
     --
-    -- Multiple possible source files, based off of source_exts and importPaths.
-    -- Output file: determined by mkObjPath and mkHiPath.
-    -- match &?> \[o, hi] -> do
+    -- This is made further complicated by the fact that -hidir
+    -- and -odir are separate. There are a lot of degrees of freedom.
+    --      - Actually, this is nearly impossible: the rule needs to
+    --      know A PRIORI what file is going to be output.  Which means
+    --      we must scan any explicitly specified files at the beginning.
+    --
+    -- TODO: also pick up C source files here
+
     [mkObjPath dflags "//*" "//*",
      mkHiPath  dflags "//*" "//*"] &%> \[o, hi] -> do
-        -- TODO: oddly asymmetric re hi and o
-        -- strip off the prefix and suffix
-        let (base_path, _) = splitExtension hi
-            (mod_path, ext)
-                = splitExtension
-                $ fromMaybe hi
-                    (do dir <- hiDir dflags
-                        dir' <- stripPrefix dir hi
-                        stripPrefix "/" dir' `mplus` return dir')
-        -- This is an interesting problem now: what module produced
-        -- this file?  There are a few possibilities.  First:
-        --
-        --      Nothing <- hiDir dflags, then the source file is
-        --      exactly in the same location.  So we don't need to
-        --      probe include directories, just filenames.
-        --
-        --      Just _ <- hiDir dflags, then the source file is
-        --      in any of the possible "include directories", we
-        --      have to probe each one to find the right place.
-        --
-        --      But here, there is ANOTHER possibility: there is a
-        --      TARGET file whose internally specified module name
-        --      is something different from the filename; this can
-        --      generate the file.  So, maybe we should do something
-        --      similar to how the non-Haskell files get explicit rules.
-        --      For now not going to worry about that.
-        let source_exts = ["hs", "lhs", "hsig", "lhsig"]
-            hs_candidates
-              = case hiDir dflags of
-                    Nothing -> map (base_path <.>) source_exts
-                    Just _ -> concatMap (\dir -> map ((dir </> mod_path) <.>) source_exts)
-                                        (importPaths dflags)
-        -- Manually probe locations until we find it.  This reimplements
-        -- findHomeModule in Finder
-        -- TODO: special case for GHC.Prim
-        let go [] = error $ "Could not find source file to build " ++ o
-            go (f:fs) = do
-                b <- doesFileExist f
-                if b then return f
-                     else go fs
-        file <- go hs_candidates
-        let hsc_src = if isHaskellSigFilename file then HsigFile else HsSrcFile
+        (odir, hidir) <- case (objectDir dflags, hiDir dflags) of
+            (Just odir, Just hidir) -> return (odir, hidir)
+            _ -> error "Usage without -odir and -hidir not supported"
+
+        -- Determine the ModuleName
+        let pathToModuleName prefix path = do
+                path <- stripPrefix prefix path
+                path <- stripPrefix "/" path `mplus` return path
+                let (base, ext) = splitExtension (dropWhile isPathSeparator path)
+                    mod_name = map (\c -> if isPathSeparator c then '.' else c) base
+                guard (looksLikeModuleName mod_name)
+                return mod_name
+
+        mod_name <- case pathToModuleName hidir hi of
+            Nothing -> error ("Not a module name interface file: " ++ hi)
+            Just mod_name -> return mod_name
+
+        r <- finder mod_name
+        loc <- case r of
+            Found loc _ -> return loc
+            _ -> error ("Could not find source for module " ++ mod_name)
+
+        let file = expectJust "shake hi/o rule" (ml_hs_file loc)
+            hsc_src = if isHaskellSigFilename file then HsigFile else HsSrcFile
         need [file]
         -- Run the oneshot compiler
         -- TROUBLE: we want to get the dependencies!!
@@ -227,6 +192,49 @@ doShake args srcs = do
 
     return ()
 
+
+{-
+    -- If you want to build a .o file, it is ambiguous whether or not it
+    -- is a Haskell or C file.  For example:
+    --
+    --      ghc --make A.c A.hs
+    --
+    -- will clobber A.o (GHC's build system does no sanity check here.)
+    -- However, we observe that GHC will never go off and build a
+    -- non-Haskell source manually; it has to be in non_hs_srcs.  So
+    -- for EACH non_hs_srcs, we add a rule for how to build its product,
+    -- with higher priority than the default Haskell rule, and leave
+    -- it at that.  To do that, we have to precompute the output
+    -- filenames of each non_hs_src file.
+    non_hs_o_files <- forM non_hs_srcs $ \(input_fn, mb_phase) -> do
+        -- This code duplicates compileFile hsc_env StopLn x
+        let mb_o_file = outputFile dflags
+            -- Some of these cases should be impossible
+            output
+             -- ToDo: kill this
+             | HscNothing <- hscTarget dflags = Temporary
+             | not (isNoLink (ghcLink dflags)) = Persistent
+             -- ToDo: kill this too
+             | isJust mb_o_file = SpecificFile
+             | otherwise = Persistent
+            (basename, _) = splitExtension input_fn
+            stopPhase = StopLn
+        output_fn <-
+            getOutputFilename stopPhase output basename dflags stopPhase Nothing
+        return ((input_fn, mb_phase), output_fn)
+
+    -- Non-Haskell files:
+    want (map snd non_hs_o_files)
+    forM non_hs_o_files $ \((input_fn, mb_phase), output_fn) -> do
+        output_fn %> \output_fn2 -> do
+            need [input_fn]
+            output_fn3 <- liftIO $ compileFile hsc_env StopLn (input_fn, mb_phase)
+            -- TODO: assert all output_fns are the same
+            assert (output_fn == output_fn2 &&
+                    output_fn == output_fn3) $ return ()
+            -- TODO: read out dependencies from C compiler
+-}
+
 -----------------------------------------------------------------------
 
 -- TARGETS
@@ -250,20 +258,36 @@ doShake args srcs = do
 
 -- NB: really want to avoid Generics, it really hurts compile time
 
+-- Irritatingly, we can't have the return value of this be a HomeModInfo,
+-- because this needs to be Hashable/Binary but I don't want to implement
+-- those classes.  GHC does, in fact, know how to deserialize these,
+-- but we can't use Shake's caching machinery to arrange for this.
 newtype TargetVal = TargetVal ()
     deriving (Show, Typeable, Eq, Hashable, Binary, NFData)
 newtype TargetKey = TargetKey (Either String FilePath)
     deriving (Show, Typeable, Eq, Hashable, Binary, NFData)
 
 instance Rule TargetKey TargetVal where
-    storedValue _ _ = return (Just (TargetVal ()))
-    equalValue _ _ _ _ = EqualCheap
+    -- Not sure what to do here
+    storedValue _ _ = return {- Nothing -- -} (Just (TargetVal ()))
+    equalValue _ _ _ _ = NotEqual
+
+targetKey :: Target -> TargetKey
+targetKey Target{ targetId = TargetModule mod_name }
+    = TargetKey (Left (moduleNameString mod_name))
+targetKey Target{ targetId = TargetFile file _ }
+    = TargetKey (Right file)
+
+wantTargets :: [TargetKey] -> Rules ()
+wantTargets targets = action (void (apply targets :: Action [TargetVal]))
 
 -----------------------------------------------------------------------
 
 -- THE HELPER
 
 -----------------------------------------------------------------------
+
+
 
 -- File targets are TOTALLY bonkers.  Consider these GHC commands:
 --
@@ -334,9 +358,10 @@ getTargetLocation Target{ targetId = TargetModule mod } =
 -- to reimplement them here so that they are properly tracked.
 
 -- FindResult?  Let's try it just for funsies...
-findHomeModule :: DynFlags -> ModuleName -> Action FindResult
-findHomeModule dflags mod_name =
+findHomeModule :: DynFlags -> String -> Action FindResult
+findHomeModule dflags str_mod_name =
    let
+     mod_name = mkModuleName str_mod_name
      home_path = importPaths dflags
      hisuf = hiSuf dflags
      mod = mkModule (thisPackage dflags) mod_name
