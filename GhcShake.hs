@@ -143,19 +143,14 @@ doShake args srcs = do
             Just mod_name -> return mod_name
 
         r <- finder mod_name
-        loc <- case r of
+        location <- case r of
             Found loc _ -> return loc
             _ -> error ("Could not find source for module " ++ mod_name)
 
-        let file = expectJust "shake hi/o rule" (ml_hs_file loc)
+        let file = expectJust "shake hi/o rule" (ml_hs_file location)
             hsc_src = if isHaskellSigFilename file then HsigFile else HsSrcFile
         need [file]
-        -- Run the oneshot compiler
-        -- TROUBLE: we want to get the dependencies!!
-        {-
-        out_o_file <- liftIO $ compileFile hsc_env StopLn {- hmm -} (file, Nothing)
-        assert (out_o_file == o) $ return ()
-        -}
+
         -- OK, let's get scrapping.  This is a duplicate of summariseFile.
         -- TODO: make preprocessing a separate rule.  But how to deal
         -- with dflags modification?!
@@ -163,7 +158,6 @@ doShake args srcs = do
         buf <- liftIO $ hGetStringBuffer hspp_fn
         (srcimps, the_imps, L _ mod_name) <- liftIO $ getImports dflags' buf hspp_fn file
         -- TODO: In 7.10 pretty sure hs location is BOGUS
-        location <- undefined -- liftIO $ mkHomeModLocation dflags mod_name file
         -- TODO: addHomeModuleToFinder?! Hella dodgy.  This has to be run EVERY
         -- build.
         -- Hella dodgy
@@ -182,6 +176,8 @@ doShake args srcs = do
                         ms_obj_date = Nothing
                       }
         -- Add the dependencies
+        let home_mods = map (moduleNameString . unLoc) (ms_home_imps summary)
+        rs <- mapM finder home_mods
         -- Each of these ModuleName's would have been computed using
         -- summariseModule. TODO: this is duplicate with get_o_file.
         -- KEY THING: we have to ACTUALLY find the module (which might
