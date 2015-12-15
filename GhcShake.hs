@@ -7,7 +7,7 @@ module GhcShake where
 
 import GhcPlugins
 import GHC ( Ghc, setSessionDynFlags, guessTarget, getSession, ImportDecl(..) )
-import DriverPipeline ( compileFile, preprocess )
+import DriverPipeline ( compileFile, preprocess, writeInterfaceOnlyMode, compileOne', compileOne )
 import DriverPhases ( Phase(..), isHaskellUserSrcFilename, isHaskellSigFilename
                     , phaseInputExt, eqPhase )
 import PipelineMonad ( PipelineOutput(..) )
@@ -15,7 +15,12 @@ import SysTools ( newTempName )
 import StringBuffer ( hGetStringBuffer )
 import HeaderInfo ( getImports )
 import PrelNames ( gHC_PRIM )
-import Maybes ( expectJust )
+import HscMain ( hscCompileOneShot )
+
+import InstEnv
+import FamInstEnv
+import Maybes
+import NameEnv
 
 import Development.Shake
 import Development.Shake.Rule
@@ -26,12 +31,14 @@ import Data.Map (Map)
 import Data.Typeable
 import Data.List
 import Data.Maybe
+import Data.IORef
 import Control.Monad
 import Control.Concurrent.MVar
 import Control.Exception
 import System.Environment
 import System.FilePath
 import System.Exit
+import qualified System.Directory as IO
 
 frontendPlugin :: FrontendPlugin
 frontendPlugin = defaultFrontendPlugin {
@@ -48,7 +55,12 @@ doShake :: [String] -> [(String, Maybe Phase)] -> Ghc ()
 doShake args srcs = do
     dflags0 <- getDynFlags
     setSessionDynFlags
-        (dflags0 { ghcMode = CompManager,
+        -- ghc --make puts modules in the HPT but this is annoying;
+        -- we'd rather demand load as necessary.  So flip to OneShot
+        -- mode to make this happen.  Food for thought: WHY can't
+        -- we just get rid of the HPT?  One downside: less obvious
+        -- how to do linking.  We'll cross that bridge eventually.
+        (dflags0 { ghcMode = CompManager, -- IRRITATING
                    ghcLink = LinkBinary })
 
     -- These will end up being our top-level wants
@@ -60,7 +72,7 @@ doShake args srcs = do
     liftIO $ do
 
     -- HPT cache
-    hpt_cache <- newMVar Map.empty
+    hpt_cache <- newMVar emptyHomePackageTable
 
     withArgs args $ do
     shakeArgs shakeOptions {
@@ -148,6 +160,7 @@ doShake args srcs = do
             _ -> error ("Could not find source for module " ++ mod_name)
 
         let file = expectJust "shake hi/o rule" (ml_hs_file location)
+            (basename, _) = splitExtension file
             hsc_src = if isHaskellSigFilename file then HsigFile else HsSrcFile
         need [file]
 
@@ -162,8 +175,9 @@ doShake args srcs = do
         -- build.
         -- Hella dodgy
         src_timestamp <- liftIO $ getModificationUTCTime file
-        let summary = ModSummary {
-                        ms_mod = mkModule (thisPackage dflags) mod_name,
+        let mod = mkModule (thisPackage dflags) mod_name
+            mod_summary = ModSummary {
+                        ms_mod = mod,
                         ms_hsc_src = hsc_src,
                         ms_location = location,
                         ms_hspp_file = hspp_fn,
@@ -175,15 +189,87 @@ doShake args srcs = do
                         ms_iface_date = Nothing,
                         ms_obj_date = Nothing
                       }
+
         -- Add the dependencies
-        let home_mods = map (moduleNameString . unLoc) (ms_home_imps summary)
+        -- TODO refactor this with target
+        let home_mods = map (moduleNameString . unLoc) (ms_home_imps mod_summary)
         rs <- mapM finder home_mods
-        -- Each of these ModuleName's would have been computed using
-        -- summariseModule. TODO: this is duplicate with get_o_file.
-        -- KEY THING: we have to ACTUALLY find the module (which might
-        -- not have a source thing, because it's an external one)
-        -- hi_deps <- mapM get_mod_hi_file (map unLoc (ms_home_imps summary))
-        -- need hi_deps
+        -- NB: We only need hi files to build, not o files!
+        -- TODo: This is not complete; we also have to track the
+        -- individual usages.  GHC will give us this information.
+        let canBuild (Found loc _) = [ ml_hi_file loc ]
+            canBuild _ = []
+            dep_locs = concatMap canBuild rs
+        need dep_locs
+        -- TODO hs-boot
+
+        -- Tricky: where should we get source_unchanged?
+        --  - It's unacceptable to say it's always changed, because this
+        --    will thwart GHC's recompilation checker.
+        --  - You can't replace GHC's recompilation checker with Shake,
+        --    because it operates on the level of semantic entities
+        --    while Shake works on files. (With a LOT more coordination
+        --    you could manage it. That would be an interesting thing
+        --    to do.)  To put it another way, Shake's job is to
+        --    handle *stability*.
+        --  - Possibility 1: directly query the o/hi and hs file for
+        --    timestamps and make a determination based on that.
+        --  - Possibility 2: get the info out of Shake.  I don't know
+        --    how to do this.
+        --
+        -- So we'll do possibility 1 first.
+        --
+        -- Careful: Shake's file algorithm is different from stability:
+        -- stability is *transitive* in GHC, while Shake is allowed
+        -- to not recompile if all of the needs did not change.
+        -- We THINK this is equivalent (at least when you're not
+        -- using GHCi, anyway), and ghc -M seems to suggest so too;
+        -- however, a lint or two would be appreciated.
+
+        -- copy-pasted from DriverPipeline
+        let dest_file | writeInterfaceOnlyMode dflags = hi
+                      | otherwise                     = o
+        source_unchanged <- liftIO $
+                     -- DO NOT use Shake's version; that would be a
+                     -- circular dependency.
+                  do dest_file_exists <- IO.doesFileExist dest_file
+                     if not dest_file_exists
+                        then return SourceModified       -- Need to recompile
+                        else do t2 <- getModificationUTCTime dest_file
+                                if t2 > src_timestamp
+                                  then return SourceUnmodified
+                                  else return SourceModified
+
+        let msg _ _ _ _ = return () -- Be quiet!!
+        hmi <- liftIO $ compileOne {- ' Nothing (Just msg) -} hsc_env mod_summary 0 0 Nothing Nothing source_unchanged
+
+        -- Add the HMI to the EPS
+        let updateEpsIO_ f = liftIO $ atomicModifyIORef' (hsc_EPS hsc_env) (\s -> (f s, ()))
+        updateEpsIO_ $ \eps -> eps {
+            -- TODO: refactor this into a "add ModDetails to EPS"
+            -- function
+            eps_PIT = extendModuleEnv (eps_PIT eps) mod (hm_iface hmi),
+            eps_PTE = extendNameEnvList (eps_PTE eps) (map (\t -> (getName t, t)) (typeEnvElts (md_types (hm_details hmi)))),
+            eps_rule_base = extendRuleBaseList (eps_rule_base eps) (md_rules (hm_details hmi)),
+            eps_inst_env = extendInstEnvList (eps_inst_env eps) (md_insts (hm_details hmi)),
+            eps_fam_inst_env = extendFamInstEnvList (eps_fam_inst_env eps)
+                                                          (md_fam_insts (hm_details hmi)),
+            eps_vect_info    = plusVectInfo (eps_vect_info eps)
+                                            (md_vect_info (hm_details hmi)),
+            eps_ann_env      = extendAnnEnvList (eps_ann_env eps)
+                                                (md_anns (hm_details hmi)),
+            eps_mod_fam_inst_env
+                             = let
+                                 fam_inst_env =
+                                   extendFamInstEnvList emptyFamInstEnv
+                                                        (md_fam_insts (hm_details hmi))
+                               in
+                               extendModuleEnv (eps_mod_fam_inst_env eps)
+                                               mod
+                                               fam_inst_env
+            -- TODO: NO STATS
+            }
+
         return ()
 
     return ()
@@ -265,8 +351,8 @@ newtype TargetKey = TargetKey (Either String FilePath)
 
 instance Rule TargetKey TargetVal where
     -- Not sure what to do here
-    storedValue _ _ = return {- Nothing -- -} (Just (TargetVal ()))
-    equalValue _ _ _ _ = NotEqual
+    storedValue _ _ = return (Just (TargetVal ()))
+    equalValue _ _ _ _ = EqualCheap
 
 targetKey :: Target -> TargetKey
 targetKey Target{ targetId = TargetModule mod_name }
