@@ -92,26 +92,22 @@ doShake args srcs = do
                         else Nothing
     } $ do
 
-    -- Want to build every target a user specified on the command line.
-    wantTargets (map targetKey targets)
-
     -- Reimplemented FinderCache with dependency tracking.
     finder <- newCache (findHomeModule dflags)
 
-    rule $ \(TargetKey k) -> case k of
-        Left mod_name -> Just $ do
+    -- Want to build every target a user specified on the command line.
+    action $ forM_ targets $ \target -> case target of
+        Target{ targetId = TargetModule mod_name } -> do
             -- No point avoiding probing for the source, because we're
             -- going to need it shortly to build the damn thing
-            r <- finder mod_name
+            let mod_name_str = moduleNameString mod_name
+            r <- finder mod_name_str
             case r of
                 -- TODO: -fno-code, should not request object file
-                -- TODO: maybe should request source file too?
                 Found loc _ -> need [ ml_hi_file loc, ml_obj_file loc ]
-                _ -> error ("Could not find module " ++ mod_name)
-            return (TargetVal ()) -- Hmmm
-        Right file -> Just $ do
+                _ -> error ("Could not find module " ++ mod_name_str)
+        Target{ targetId = TargetFile file _ } ->
             error "Can't handle file targets yet"
-            return (TargetVal ())
 
     -- Haskell rules, the plan:
     --  1. From the output file name, find the source file
@@ -241,7 +237,7 @@ doShake args srcs = do
                                   else return SourceModified
 
         let msg _ _ _ _ = return () -- Be quiet!!
-        hmi <- liftIO $ compileOne {- ' Nothing (Just msg) -} hsc_env mod_summary 0 0 Nothing Nothing source_unchanged
+        hmi <- liftIO $ compileOne' Nothing (Just msg) hsc_env mod_summary 0 0 Nothing Nothing source_unchanged
 
         -- Add the HMI to the EPS
         let updateEpsIO_ f = liftIO $ atomicModifyIORef' (hsc_EPS hsc_env) (\s -> (f s, ()))
@@ -316,52 +312,6 @@ doShake args srcs = do
                     output_fn == output_fn3) $ return ()
             -- TODO: read out dependencies from C compiler
 -}
-
------------------------------------------------------------------------
-
--- TARGETS
-
------------------------------------------------------------------------
-
--- Targets are specified on the command line, and what are "wanted".
--- However, we can't just directly translate a target into a file:
--- in general, it's not obvious how a target maps to outputs.  For example,
--- if you type ghc --make A.hs -outputdir out, this will usually produce an
--- out/A.hi...  except if the A.hs file actually has the header "module B", in
--- which case it will be put in out/B.hi.
---
--- We could do a bit of computation in IO to figure what the files are
--- supposed to be.  However, some of this computation involves probing
--- the filesystem and reading files out, and wants to use Shake's cache.  So
--- it's better to do it in Action monad, and that means we have to
--- make special rules to deal with targets.  These rules are trivial
--- (and so we don't worry about getting storedValue); they just figure
--- out what files you need, and request them to be built.
-
--- NB: really want to avoid Generics, it really hurts compile time
-
--- Irritatingly, we can't have the return value of this be a HomeModInfo,
--- because this needs to be Hashable/Binary but I don't want to implement
--- those classes.  GHC does, in fact, know how to deserialize these,
--- but we can't use Shake's caching machinery to arrange for this.
-newtype TargetVal = TargetVal ()
-    deriving (Show, Typeable, Eq, Hashable, Binary, NFData)
-newtype TargetKey = TargetKey (Either String FilePath)
-    deriving (Show, Typeable, Eq, Hashable, Binary, NFData)
-
-instance Rule TargetKey TargetVal where
-    -- Not sure what to do here
-    storedValue _ _ = return (Just (TargetVal ()))
-    equalValue _ _ _ _ = EqualCheap
-
-targetKey :: Target -> TargetKey
-targetKey Target{ targetId = TargetModule mod_name }
-    = TargetKey (Left (moduleNameString mod_name))
-targetKey Target{ targetId = TargetFile file _ }
-    = TargetKey (Right file)
-
-wantTargets :: [TargetKey] -> Rules ()
-wantTargets targets = action (void (apply targets :: Action [TargetVal]))
 
 -----------------------------------------------------------------------
 
