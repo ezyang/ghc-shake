@@ -16,6 +16,7 @@ import StringBuffer ( hGetStringBuffer )
 import HeaderInfo ( getImports )
 import PrelNames ( gHC_PRIM )
 import HscMain ( hscCompileOneShot )
+import Finder ( addHomeModuleToFinder )
 
 import InstEnv
 import FamInstEnv
@@ -60,8 +61,9 @@ doShake args srcs = do
         -- mode to make this happen.  Food for thought: WHY can't
         -- we just get rid of the HPT?  One downside: less obvious
         -- how to do linking.  We'll cross that bridge eventually.
-        (dflags0 { ghcMode = CompManager, -- IRRITATING
-                   ghcLink = LinkBinary })
+        (dflags0 { ghcMode = OneShot, -- IRRITATING
+                   ghcLink = LinkBinary,
+                   importPaths = maybe [] (:[]) (hiDir dflags0) ++ importPaths dflags0 })
 
     -- These will end up being our top-level wants
     let (hs_srcs, non_hs_srcs) = partition haskellish srcs
@@ -237,7 +239,7 @@ doShake args srcs = do
                                   else return SourceModified
 
         let msg _ _ _ _ = return () -- Be quiet!!
-        hmi <- liftIO $ compileOne' Nothing (Just msg) hsc_env mod_summary 0 0 Nothing Nothing source_unchanged
+        hmi <- traced ("GHC " ++ moduleNameString mod_name) $ compileOne' Nothing (Just msg) hsc_env mod_summary 0 0 Nothing Nothing source_unchanged
 
         -- Add the HMI to the EPS
         let updateEpsIO_ f = liftIO $ atomicModifyIORef' (hsc_EPS hsc_env) (\s -> (f s, ()))
@@ -265,6 +267,9 @@ doShake args srcs = do
                                                fam_inst_env
             -- TODO: NO STATS
             }
+
+        -- ...and the Finder cache
+        liftIO $ addHomeModuleToFinder hsc_env mod_name location
 
         return ()
 
