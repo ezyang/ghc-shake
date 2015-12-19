@@ -1,12 +1,13 @@
 {-# LANGUAGE NondecreasingIndentation #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE CPP #-}
 {-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 module GhcShake where
 
 import GhcPlugins
-import GHC ( Ghc, setSessionDynFlags, guessTarget, getSession, ImportDecl(..) )
+import GHC ( Ghc, setSessionDynFlags, guessTarget, getSession, ImportDecl(..), printException )
 import DriverPipeline ( compileFile, preprocess, writeInterfaceOnlyMode, compileOne', compileOne )
 import DriverPhases ( Phase(..), isHaskellUserSrcFilename, isHaskellSigFilename
                     , phaseInputExt, eqPhase )
@@ -17,6 +18,7 @@ import HeaderInfo ( getImports )
 import PrelNames ( gHC_PRIM )
 import HscMain ( hscCompileOneShot )
 import Finder ( addHomeModuleToFinder )
+import ErrUtils ( printBagOfErrors )
 
 import InstEnv
 import FamInstEnv
@@ -239,7 +241,12 @@ doShake args srcs = do
                                   else return SourceModified
 
         let msg _ _ _ _ = return () -- Be quiet!!
-        hmi <- traced ("GHC " ++ moduleNameString mod_name) $ compileOne' Nothing (Just msg) hsc_env mod_summary 0 0 Nothing Nothing source_unchanged
+        hmi <- traced file
+              -- Shake destroyed our exception handler boo hoo
+              . handle (\(e :: SourceError) -> printBagOfErrors dflags (srcErrorMessages e)
+                                            >> error "compileOne'")
+              $ compileOne' Nothing (Just msg) hsc_env mod_summary
+                            0 0 Nothing Nothing source_unchanged
 
         -- Add the HMI to the EPS
         let updateEpsIO_ f = liftIO $ atomicModifyIORef' (hsc_EPS hsc_env) (\s -> (f s, ()))
