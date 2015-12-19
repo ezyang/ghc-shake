@@ -14,11 +14,11 @@ for var in "$@"; do
         ARGS+=("-ffrontend-opt")
         ARGS+=("--keep-going")
         ARGS+=("-ffrontend-opt")
-        ARGS+=("--progress")
+        ARGS+=("--progress=record")
         ARGS+=("-package-db")
         ARGS+=("$(dirname $0)/dist/package.conf.inplace/")
         ARGS+=("-package")
         ARGS+=("ghc-shake")
     fi
 done
-"$(dirname $0)/ghc" "${ARGS[@]}"
+exec "$(dirname $0)/ghc" "${ARGS[@]}"
