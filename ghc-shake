@@ -1,0 +1,24 @@
+#!/bin/bash
+ARGS=()
+for var in "$@"; do
+    if [ "$var" != '--make' ]
+    then
+        ARGS+=("$var")
+    else
+        ARGS+=("--frontend")
+        ARGS+=("GhcShake")
+        ARGS+=("-ffrontend-opt")
+        ARGS+=("--verbose")
+        ARGS+=("-ffrontend-opt")
+        ARGS+=("--profile")
+        ARGS+=("-ffrontend-opt")
+        ARGS+=("--keep-going")
+        ARGS+=("-ffrontend-opt")
+        ARGS+=("--progress")
+        ARGS+=("-package-db")
+        ARGS+=("$(dirname $0)/dist/package.conf.inplace/")
+        ARGS+=("-package")
+        ARGS+=("ghc-shake")
+    fi
+done
+"$(dirname $0)/ghc" "${ARGS[@]}"
