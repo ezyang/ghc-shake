@@ -1,0 +1,5 @@
+ghc
+ghc-pkg
+dist
+dist-newstyle
+.shake

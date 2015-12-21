@@ -29,6 +29,7 @@ import Development.Shake
 import Development.Shake.Rule
 import Development.Shake.Classes
 
+import System.Posix.Signals
 import qualified Data.Map as Map
 import Data.Map (Map)
 import Data.Typeable
@@ -75,8 +76,14 @@ doShake args srcs = do
     hsc_env <- getSession
     liftIO $ do
 
-    -- HPT cache
-    hpt_cache <- newMVar emptyHomePackageTable
+    -- Restore normal signal handlers, since we're not GHCi!
+    -- TODO: don't try to do this on Windows
+    installHandler sigINT Default Nothing
+    installHandler sigHUP Default Nothing
+    installHandler sigTERM Default Nothing
+    installHandler sigQUIT Default Nothing
+
+    statusMsgRef <- newIORef ""
 
     withArgs args $ do
     shakeArgs shakeOptions {
@@ -93,7 +100,8 @@ doShake args srcs = do
         shakeLint = Just LintBasic, -- for dev
         shakeAssume = if gopt Opt_ForceRecomp dflags
                         then Just AssumeDirty
-                        else Nothing
+                        else Nothing,
+        shakeProgress = progressDisplay 1 (atomicWriteIORef statusMsgRef)
     } $ do
 
     -- Reimplemented FinderCache with dependency tracking.
@@ -163,6 +171,9 @@ doShake args srcs = do
             (basename, _) = splitExtension file
             hsc_src = if isHaskellSigFilename file then HsigFile else HsSrcFile
         need [file]
+
+        status_msg <- liftIO $ readIORef statusMsgRef
+        putNormal ("[" ++ status_msg ++ "] GHC " ++ file)
 
         -- OK, let's get scrapping.  This is a duplicate of summariseFile.
         -- TODO: make preprocessing a separate rule.  But how to deal
@@ -241,7 +252,7 @@ doShake args srcs = do
                                   else return SourceModified
 
         let msg _ _ _ _ = return () -- Be quiet!!
-        hmi <- traced file
+        hmi <- quietly . traced file
               -- Shake destroyed our exception handler boo hoo
               . handle (\(e :: SourceError) -> printBagOfErrors dflags (srcErrorMessages e)
                                             >> error "compileOne'")
@@ -249,6 +260,8 @@ doShake args srcs = do
                             0 0 Nothing Nothing source_unchanged
 
         -- Add the HMI to the EPS
+        -- PROBLEM: this occasionally deadlocks! Disaster.
+        {-
         let updateEpsIO_ f = liftIO $ atomicModifyIORef' (hsc_EPS hsc_env) (\s -> (f s, ()))
         updateEpsIO_ $ \eps -> eps {
             -- TODO: refactor this into a "add ModDetails to EPS"
@@ -274,6 +287,7 @@ doShake args srcs = do
                                                fam_inst_env
             -- TODO: NO STATS
             }
+            -}
 
         -- ...and the Finder cache
         liftIO $ addHomeModuleToFinder hsc_env mod_name location
@@ -428,7 +442,8 @@ type BaseName = String
 mkHomeModLocationSearched :: DynFlags -> ModuleName -> FileExt
                           -> FilePath -> BaseName -> ModLocation
 mkHomeModLocationSearched dflags mod suff path basename =
-   mkHomeModLocation2 dflags mod (path </> basename) suff
+   mkHomeModLocation2 dflags mod (if path == "." then basename
+                                                 else path </> basename) suff
 
 mkHomeModLocation2 :: DynFlags
                    -> ModuleName
