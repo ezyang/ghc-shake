@@ -7,23 +7,28 @@
 module GhcShake where
 
 import GhcPlugins
-import GHC ( Ghc, setSessionDynFlags, guessTarget, getSession, ImportDecl(..), printException )
-import DriverPipeline ( compileFile, preprocess, writeInterfaceOnlyMode, compileOne', compileOne )
+import GHC ( Ghc, setSessionDynFlags, getSession, ImportDecl(..), printException, GhcMonad(..) )
+import DriverPipeline ( compileFile, preprocess, writeInterfaceOnlyMode, compileOne', compileOne, exeFileName, linkBinary )
 import DriverPhases ( Phase(..), isHaskellUserSrcFilename, isHaskellSigFilename
-                    , phaseInputExt, eqPhase )
+                    , phaseInputExt, eqPhase, isHaskellSrcFilename )
 import PipelineMonad ( PipelineOutput(..) )
 import SysTools ( newTempName )
 import StringBuffer ( hGetStringBuffer )
 import HeaderInfo ( getImports )
-import PrelNames ( gHC_PRIM )
+import PrelNames ( gHC_PRIM, mAIN )
 import HscMain ( hscCompileOneShot )
-import Finder ( addHomeModuleToFinder )
+import Finder ( addHomeModuleToFinder, mkHomeModLocation )
 import ErrUtils ( printBagOfErrors )
+import Platform ( platformBinariesAreStaticLibs )
+import LoadIface ( loadSysInterface )
+import TcRnMonad ( initIfaceCheck )
 
+import HscTypes
 import InstEnv
 import FamInstEnv
 import Maybes
 import NameEnv
+import Panic
 
 import Development.Shake
 import Development.Shake.Rule
@@ -57,6 +62,20 @@ frontendPlugin = defaultFrontendPlugin {
 
 doShake :: [String] -> [(String, Maybe Phase)] -> Ghc ()
 doShake args srcs = do
+    -- These will end up being our top-level wants
+    let (hs_srcs, non_hs_srcs) = partition haskellish srcs
+    targets <- mapM (uncurry guessTarget) hs_srcs
+
+    -- For now, we assume that a file target is the executable target.
+    let get_file_target Target { targetId = TargetFile file _ } = Just file
+        get_file_target _ = Nothing
+        mb_mainFile
+          = case mapMaybe get_file_target targets of
+                [] -> Nothing
+                [x] -> Just x
+                (_:_:_) -> error "Multiple file targets not supported"
+        mb_output_file = fmap guessOutputFile mb_mainFile
+
     dflags0 <- getDynFlags
     setSessionDynFlags
         -- ghc --make puts modules in the HPT but this is annoying;
@@ -65,14 +84,24 @@ doShake args srcs = do
         -- we just get rid of the HPT?  One downside: less obvious
         -- how to do linking.  We'll cross that bridge eventually.
         (dflags0 { ghcMode = OneShot, -- IRRITATING
-                   ghcLink = LinkBinary,
-                   importPaths = maybe [] (:[]) (hiDir dflags0) ++ importPaths dflags0 })
-
-    -- These will end up being our top-level wants
-    let (hs_srcs, non_hs_srcs) = partition haskellish srcs
-    targets <- mapM (uncurry guessTarget) hs_srcs
+                   -- DANGER, this is OK because default is LinkBinary
+                   -- ghcLink = LinkBinary,
+                   importPaths = maybe [] (:[]) (hiDir dflags0) ++ importPaths dflags0,
+                   -- clear it for normal compilation
+                   outputFile = Nothing
+                     })
 
     dflags <- getDynFlags
+    let linker_dflags = dflags { outputFile =
+            case outputFile dflags0 of
+                Nothing -> mb_output_file
+                r -> r
+            }
+    let -- copypasted from DriverPipeline.hs
+        staticLink = case ghcLink dflags of
+                        LinkStaticLib -> True
+                        _ -> platformBinariesAreStaticLibs (targetPlatform dflags)
+
     hsc_env <- getSession
     liftIO $ do
 
@@ -104,8 +133,17 @@ doShake args srcs = do
         shakeProgress = progressDisplay 1 (atomicWriteIORef statusMsgRef)
     } $ do
 
+    (odir, hidir) <- case (objectDir dflags, hiDir dflags) of
+        (Just odir, Just hidir) -> return (odir, hidir)
+        _ -> error "Usage without -odir and -hidir not supported"
+
+    when (mainModIs dflags /= mAIN) $
+        error "-main-is not supported"
+
+    when (not (null non_hs_srcs)) $ error "non-Haskell source files not supported"
+
     -- Reimplemented FinderCache with dependency tracking.
-    finder <- newCache (findHomeModule dflags)
+    finder <- newCache (findHomeModule dflags mb_mainFile)
 
     -- Want to build every target a user specified on the command line.
     action $ forM_ targets $ \target -> case target of
@@ -119,7 +157,39 @@ doShake args srcs = do
                 Found loc _ -> need [ ml_hi_file loc, ml_obj_file loc ]
                 _ -> error ("Could not find module " ++ mod_name_str)
         Target{ targetId = TargetFile file _ } ->
-            error "Can't handle file targets yet"
+            -- Supporting this in full generality is difficult
+            --      * We assume this is for an executable, so only
+            --        one file target is supported.
+            --      * We assume -main-is is NOT set (so the module
+            --        defines Main)
+            if isNoLink (ghcLink dflags)
+                then need [ hidir </> "Main" <.> hiSuf dflags ]
+                else need [ exeFileName staticLink linker_dflags ]
+
+    -- How to link the top-level thing
+    exeFileName staticLink linker_dflags %> \out -> do
+        need [ hidir </> "Main" <.> hiSuf dflags ]
+        -- Compute the transitive home modules
+        main_iface <- liftIO . initIfaceCheck hsc_env
+                    $ loadSysInterface (text "linking main") mAIN
+        let mod_name_deps = map fst . filter (not.snd)
+                          . dep_mods . mi_deps $ main_iface
+        dep_loc_mods <- getDepLocs finder mod_name_deps
+        -- assert dep_loc_mods is all home modules
+        let obj_files = map (ml_obj_file . fst) dep_loc_mods
+        need obj_files
+        let pkg_deps = map fst . dep_pkgs . mi_deps $ main_iface
+        -- TODO: this is slightly buggy; if a module is mentioned
+        -- on the command line, it should be linked in.
+        -- Reimplements link' in DriverPipeline
+        let link = case ghcLink dflags of
+                LinkBinary    -> linkBinary
+                other         -> error "don't know how to link this way"
+        traced "linking" $
+            link linker_dflags
+                ((odir </> "Main" <.> objectSuf dflags)
+                    : obj_files) pkg_deps
+        return ()
 
     -- Haskell rules, the plan:
     --  1. From the output file name, find the source file
@@ -145,10 +215,6 @@ doShake args srcs = do
 
     [mkObjPath dflags "//*" "//*",
      mkHiPath  dflags "//*" "//*"] &%> \[o, hi] -> do
-        (odir, hidir) <- case (objectDir dflags, hiDir dflags) of
-            (Just odir, Just hidir) -> return (odir, hidir)
-            _ -> error "Usage without -odir and -hidir not supported"
-
         -- Determine the ModuleName
         let pathToModuleName prefix path = do
                 path <- stripPrefix prefix path
@@ -203,15 +269,9 @@ doShake args srcs = do
 
         -- Add the dependencies
         -- TODO refactor this with target
-        let home_mods = map (moduleNameString . unLoc) (ms_home_imps mod_summary)
-        rs <- mapM finder home_mods
-        -- NB: We only need hi files to build, not o files!
-        -- TODo: This is not complete; we also have to track the
-        -- individual usages.  GHC will give us this information.
-        let canBuild (Found loc _) = [ ml_hi_file loc ]
-            canBuild _ = []
-            dep_locs = concatMap canBuild rs
-        need dep_locs
+        let home_mod_names = map unLoc (ms_home_imps mod_summary)
+        dep_loc_mods <- getDepLocs finder home_mod_names
+        need (map (ml_hi_file . fst) dep_loc_mods)
         -- TODO hs-boot
 
         -- Tricky: where should we get source_unchanged?
@@ -261,6 +321,8 @@ doShake args srcs = do
 
         -- Add the HMI to the EPS
         -- PROBLEM: this occasionally deadlocks! Disaster.
+        -- It's not a big deal if we don't, because we only pay the
+        -- extra parsing cost once per module in HPT.
         {-
         let updateEpsIO_ f = liftIO $ atomicModifyIORef' (hsc_EPS hsc_env) (\s -> (f s, ()))
         updateEpsIO_ $ \eps -> eps {
@@ -345,7 +407,17 @@ doShake args srcs = do
 
 -----------------------------------------------------------------------
 
-
+getDepLocs :: (String -> Action FindResult) -> [ModuleName]
+           -> Action [(ModLocation, Module)]
+getDepLocs finder home_mods = do
+    rs <- mapM (finder . moduleNameString) home_mods
+    -- NB: We only need hi files to build, not o files!
+    -- TODo: This is not complete; we also have to track the
+    -- individual usages.  GHC will give us this information.
+    let canBuild (Found loc mod) = [ (loc, mod) ]
+        -- NB: don't error here, might be an external package import
+        canBuild _ = []
+    return $ concatMap canBuild rs
 
 -- File targets are TOTALLY bonkers.  Consider these GHC commands:
 --
@@ -358,50 +430,6 @@ doShake args srcs = do
 -- to be a TargetFile, if the file exists, so a client can't even be
 -- sure they managed to force all modules.
 
-{-
--- | Determine the build output(s) of a target.  This is (relatively) easy to do
--- for modules but hard to do for files.
-getTargetLocation :: Target -> IO ModLocation
-getTargetLocation Target{ targetId = TargetModule mod } =
-    -- If both objectDir and hiDir are explicitly set, there's no need
-    -- to probe
-    case (objectDir dflags, hiDir dflags) of
-        Just odir -> return (dir </> moduleNameSlashes mod <.> osuf)
-
-
--- getTargetLocation :: Action FindResult
-
-    let osuf = objectSuf dflags
-        hisuf = hiSuf dflags
-        -- Goofily reimplemented version of mkObjPath/mkHiPath
-        get_mod_o_file mod =
-            case objectDir dflags of
-                Just dir -> return (dir </> moduleNameSlashes mod <.> osuf)
-                -- To do this, you have to go and find the source directory
-                Nothing  -> pprPanic "unimplemented o module target" (ppr mod)
-        get_o_file Target{ targetId = TargetModule mod } = get_mod_o_file mod
-        get_o_file Target{ targetId = TargetFile file mb_phase } = -- TODO mb_phase
-            let (basename, extension) = splitExtension file
-            in case objectDir dflags of
-                -- To do this, you have to look at the module name in the file
-                Just dir -> pprPanic "unimplemented o file target" (text file)
-                Nothing -> return (basename <.> osuf)
-        -- NB: GHC treats A.hs and A/A.hs oddly inconsistently.  It makes
-        -- sense (this means you can compile MyProgram.hs with ghc --make
-        -- MyProgram but be careful!)
-        get_mod_hi_file mod =
-            case hiDir dflags of
-                Just dir -> return (dir </> moduleNameSlashes mod <.> hisuf)
-                -- To do this, you have to go and find the source directory
-                Nothing  -> pprPanic "unimplemented hi module target" (ppr mod)
-        get_hi_file Target{ targetId = TargetModule mod } = get_mod_hi_file mod
-        get_hi_file Target{ targetId = TargetFile file mb_phase } = -- TODO mb_phase
-            let (basename, extension) = splitExtension file
-            in case hiDir dflags of
-                -- To do this, you have to look at the module name in the file
-                Just dir -> pprPanic "unimplemented hi file target" (text file)
-                Nothing -> return (basename <.> hisuf)
--}
 -----------------------------------------------------------------------
 
 -- THE REIMPLEMENTED
@@ -415,9 +443,11 @@ getTargetLocation Target{ targetId = TargetModule mod } =
 -- However, finder actions are *build-system* relevant.  So we have
 -- to reimplement them here so that they are properly tracked.
 
--- FindResult?  Let's try it just for funsies...
-findHomeModule :: DynFlags -> String -> Action FindResult
-findHomeModule dflags str_mod_name =
+-- NB: mb_mainFile is to tell where to find the Main file.  In general,
+-- ALL file targets could contribute extra found modules, but we're
+-- only supporting main for now.
+findHomeModule :: DynFlags -> Maybe FilePath -> (String -> Action FindResult)
+findHomeModule dflags mb_mainFile str_mod_name =
    let
      mod_name = mkModuleName str_mod_name
      home_path = importPaths dflags
@@ -433,8 +463,13 @@ findHomeModule dflags str_mod_name =
 
    in
   if mod == gHC_PRIM
-        then return (Found (error "GHC.Prim ModLocation") mod)
-        else searchPathExts home_path mod exts
+    then return (Found (error "GHC.Prim ModLocation") mod)
+    else case mb_mainFile of
+            Just mainFile
+                | str_mod_name == "Main" -> do
+                loc <- liftIO $ mkHomeModLocation dflags (moduleName mAIN) mainFile
+                return (Found loc mAIN)
+            _ -> searchPathExts home_path mod exts
 
 type FileExt = String
 type BaseName = String
@@ -496,6 +531,30 @@ searchPathExts paths mod exts
       if b
         then return (Found loc mod)
         else search rest
+
+-- Reimplemented this because the default algo treats too many things
+-- as files
+guessTarget :: GhcMonad m => String -> Maybe Phase -> m Target
+guessTarget str (Just phase)
+   = return (Target (TargetFile str (Just phase)) True Nothing)
+guessTarget str Nothing
+   | isHaskellSrcFilename file
+   = return (target (TargetFile file Nothing))
+   | otherwise
+   = do if looksLikeModuleName file
+           then return (target (TargetModule (mkModuleName file)))
+           else do
+        dflags <- getDynFlags
+        liftIO $ throwGhcExceptionIO
+                 (ProgramError (showSDoc dflags $
+                 text "target" <+> quotes (text file) <+> 
+                 text "is not a module name or a source file"))
+     where
+         (file,obj_allowed)
+                | '*':rest <- str = (rest, False)
+                | otherwise       = (str,  True)
+
+         target tid = Target tid obj_allowed Nothing
 
 -----------------------------------------------------------------------
 
@@ -611,3 +670,14 @@ ms_home_srcimps = home_imps . ms_srcimps
 
 ms_home_imps :: ModSummary -> [Located ModuleName]
 ms_home_imps = home_imps . ms_imps
+
+-- | If there is no -o option, guess the name of target executable
+-- by using top-level source file name as a base.
+guessOutputFile :: FilePath -> FilePath
+guessOutputFile mainModuleSrcPath =
+    let name = dropExtension mainModuleSrcPath
+    in if name == mainModuleSrcPath
+        then throwGhcException . UsageError $
+                 "default output name would overwrite the input file; " ++
+                 "must specify -o explicitly"
+        else name

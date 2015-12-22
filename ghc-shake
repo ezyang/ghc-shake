@@ -2,6 +2,7 @@
 ARGS=()
 for var in "$@"; do
     if [ "$var" != '--make' ]
+    #if true
     then
         ARGS+=("$var")
     else
@@ -9,6 +10,8 @@ for var in "$@"; do
         ARGS+=("GhcShake")
         ARGS+=("-ffrontend-opt")
         ARGS+=("--profile")
+        #ARGS+=("-ffrontend-opt")
+        #ARGS+=("--debug")
         ARGS+=("-ffrontend-opt")
         ARGS+=("--keep-going")
         ARGS+=("-ffrontend-opt")
