@@ -47,8 +47,6 @@ projects you want to build as well as ghc-shake.  Then you can say:
 
     1. hs-boot files
 
-    2. Non-use of -outputdir
-
-    3. Linking things that are not executables
+    2. Linking things that are not executables
 
 If you need something, shout and I'll try to implement it.

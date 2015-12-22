@@ -1,0 +1,33 @@
+
+        -- Add the HMI to the EPS
+        -- PROBLEM: this occasionally deadlocks! Disaster.
+        -- It's not a big deal if we don't, because we only pay the
+        -- extra parsing cost once per module in HPT.
+        {-
+        let updateEpsIO_ f = liftIO $ atomicModifyIORef' (hsc_EPS hsc_env) (\s -> (f s, ()))
+        updateEpsIO_ $ \eps -> eps {
+            -- TODO: refactor this into a "add ModDetails to EPS"
+            -- function
+            eps_PIT = extendModuleEnv (eps_PIT eps) mod (hm_iface hmi),
+            eps_PTE = extendNameEnvList (eps_PTE eps) (map (\t -> (getName t, t)) (typeEnvElts (md_types (hm_details hmi)))),
+            eps_rule_base = extendRuleBaseList (eps_rule_base eps) (md_rules (hm_details hmi)),
+            eps_inst_env = extendInstEnvList (eps_inst_env eps) (md_insts (hm_details hmi)),
+            eps_fam_inst_env = extendFamInstEnvList (eps_fam_inst_env eps)
+                                                          (md_fam_insts (hm_details hmi)),
+            eps_vect_info    = plusVectInfo (eps_vect_info eps)
+                                            (md_vect_info (hm_details hmi)),
+            eps_ann_env      = extendAnnEnvList (eps_ann_env eps)
+                                                (md_anns (hm_details hmi)),
+            eps_mod_fam_inst_env
+                             = let
+                                 fam_inst_env =
+                                   extendFamInstEnvList emptyFamInstEnv
+                                                        (md_fam_insts (hm_details hmi))
+                               in
+                               extendModuleEnv (eps_mod_fam_inst_env eps)
+                                               mod
+                                               fam_inst_env
+            -- TODO: NO STATS
+            }
+            -}
+

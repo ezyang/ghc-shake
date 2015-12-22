@@ -133,10 +133,6 @@ doShake args srcs = do
         shakeProgress = progressDisplay 1 (atomicWriteIORef statusMsgRef)
     } $ do
 
-    (odir, hidir) <- case (objectDir dflags, hiDir dflags) of
-        (Just odir, Just hidir) -> return (odir, hidir)
-        _ -> error "Usage without -odir and -hidir not supported"
-
     when (mainModIs dflags /= mAIN) $
         error "-main-is not supported"
 
@@ -163,12 +159,13 @@ doShake args srcs = do
             --      * We assume -main-is is NOT set (so the module
             --        defines Main)
             if isNoLink (ghcLink dflags)
-                then need [ hidir </> "Main" <.> hiSuf dflags ]
+                then need [ mkHiPath dflags (dropExtension file) "Main" ]
                 else need [ exeFileName staticLink linker_dflags ]
 
     -- How to link the top-level thing
     exeFileName staticLink linker_dflags %> \out -> do
-        need [ hidir </> "Main" <.> hiSuf dflags ]
+        let mainFile = fromJust mb_mainFile
+        need [ mkHiPath dflags (dropExtension mainFile) "Main" ]
         -- Compute the transitive home modules
         main_iface <- liftIO . initIfaceCheck hsc_env
                     $ loadSysInterface (text "linking main") mAIN
@@ -187,7 +184,7 @@ doShake args srcs = do
                 other         -> error "don't know how to link this way"
         traced "linking" $
             link linker_dflags
-                ((odir </> "Main" <.> objectSuf dflags)
+                ((mkObjPath dflags (dropExtension mainFile) "Main")
                     : obj_files) pkg_deps
         return ()
 
@@ -215,27 +212,49 @@ doShake args srcs = do
 
     [mkObjPath dflags "//*" "//*",
      mkHiPath  dflags "//*" "//*"] &%> \[o, hi] -> do
-        -- Determine the ModuleName
-        let pathToModuleName prefix path = do
-                path <- stripPrefix prefix path
-                path <- stripPrefix "/" path `mplus` return path
-                let (base, ext) = splitExtension (dropWhile isPathSeparator path)
-                    mod_name = map (\c -> if isPathSeparator c then '.' else c) base
-                guard (looksLikeModuleName mod_name)
-                return mod_name
+        location <- case hiDir dflags of
+            Nothing -> do
+                -- The destination path tells us directly where
+                -- the source file is
+                let basePath = dropExtension hi
+                    -- We shouldn't have to probe this again (we
+                    -- "found it" before) but it's not obvious
+                    -- what the module name we're trying to build
+                    -- is.  So this seems to work ok.
+                    exts = ["hs", "lhs", "hsig", "lhsig"]
+                    search [] = error "Can't find file"
+                    search (ext:exts) = do
+                        b <- doesFileExist (basePath <.> ext)
+                        if b then return (basePath <.> ext)
+                             else search exts
+                path <- search exts
+                return ModLocation {
+                            ml_hs_file = Just path,
+                            ml_hi_file = hi,
+                            ml_obj_file = o }
+            Just hidir -> do
+                -- Determine the ModuleName
+                let pathToModuleName prefix path = do
+                        path <- stripPrefix prefix path
+                        path <- stripPrefix "/" path `mplus` return path
+                        let (base, ext) = splitExtension (dropWhile isPathSeparator path)
+                            mod_name = map (\c -> if isPathSeparator c then '.' else c) base
+                        guard (looksLikeModuleName mod_name)
+                        return mod_name
 
-        mod_name <- case pathToModuleName hidir hi of
-            Nothing -> error ("Not a module name interface file: " ++ hi)
-            Just mod_name -> return mod_name
+                mod_name <- case pathToModuleName hidir hi of
+                    Nothing -> error ("Not a module name interface file: " ++ hi)
+                    Just mod_name -> return mod_name
 
-        r <- finder mod_name
-        location <- case r of
-            Found loc _ -> return loc
-            _ -> error ("Could not find source for module " ++ mod_name)
+                r <- finder mod_name
+                case r of
+                    Found loc _ -> return loc
+                    _ -> error ("Could not find source for module " ++ mod_name)
 
         let file = expectJust "shake hi/o rule" (ml_hs_file location)
             (basename, _) = splitExtension file
             hsc_src = if isHaskellSigFilename file then HsigFile else HsSrcFile
+
         need [file]
 
         status_msg <- liftIO $ readIORef statusMsgRef
@@ -319,39 +338,8 @@ doShake args srcs = do
               $ compileOne' Nothing (Just msg) hsc_env mod_summary
                             0 0 Nothing Nothing source_unchanged
 
-        -- Add the HMI to the EPS
-        -- PROBLEM: this occasionally deadlocks! Disaster.
-        -- It's not a big deal if we don't, because we only pay the
-        -- extra parsing cost once per module in HPT.
-        {-
-        let updateEpsIO_ f = liftIO $ atomicModifyIORef' (hsc_EPS hsc_env) (\s -> (f s, ()))
-        updateEpsIO_ $ \eps -> eps {
-            -- TODO: refactor this into a "add ModDetails to EPS"
-            -- function
-            eps_PIT = extendModuleEnv (eps_PIT eps) mod (hm_iface hmi),
-            eps_PTE = extendNameEnvList (eps_PTE eps) (map (\t -> (getName t, t)) (typeEnvElts (md_types (hm_details hmi)))),
-            eps_rule_base = extendRuleBaseList (eps_rule_base eps) (md_rules (hm_details hmi)),
-            eps_inst_env = extendInstEnvList (eps_inst_env eps) (md_insts (hm_details hmi)),
-            eps_fam_inst_env = extendFamInstEnvList (eps_fam_inst_env eps)
-                                                          (md_fam_insts (hm_details hmi)),
-            eps_vect_info    = plusVectInfo (eps_vect_info eps)
-                                            (md_vect_info (hm_details hmi)),
-            eps_ann_env      = extendAnnEnvList (eps_ann_env eps)
-                                                (md_anns (hm_details hmi)),
-            eps_mod_fam_inst_env
-                             = let
-                                 fam_inst_env =
-                                   extendFamInstEnvList emptyFamInstEnv
-                                                        (md_fam_insts (hm_details hmi))
-                               in
-                               extendModuleEnv (eps_mod_fam_inst_env eps)
-                                               mod
-                                               fam_inst_env
-            -- TODO: NO STATS
-            }
-            -}
-
-        -- ...and the Finder cache
+        -- We'd like to add the hmi to the EPS, but this sometimes
+        -- deadlocks.
         liftIO $ addHomeModuleToFinder hsc_env mod_name location
 
         return ()
