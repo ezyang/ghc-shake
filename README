@@ -1,0 +1,54 @@
+ghc-shake
+
+This is a reimplementation of ghc --make using Shake.  It's entirely one
+process, so unlike out-of-process Shake, you won't see any slowdown
+compared to --make if you compile with only one core.
+
+# What's the benefit?
+
+    1. You get faster rebuild checking, because Shake doesn't
+    recompute the entire dependency graph (ghc --make must
+    preprocess and parse all source code every time it loads.)
+
+    2. You can keep going even when one file fails to compile,
+    making sure that anything can be built, is built.
+
+    3. You get all the nice Shake features, e.g. estimated
+    completion time and profiling.  The profiling is really
+    handy!
+
+# How do I use it?
+
+Currently, I'm testing on a very specific configuration:
+
+    - GHC 7.10 with frontend-plugins.  Get it here:
+        https://github.com/ezyang/ghc/tree/ghc-7.10-frontend-plugins
+
+    - Cabal with nix-local-build.  Get it here:
+        https://github.com/haskell/cabal/tree/nix-local-build
+
+Once you've installed that GHC, make two symlinks in this directory, ghc
+and ghc-pkg, which point to the version of GHC you want to use.  If you've
+added that GHC to your path, these commands will do:
+
+    ln -s `which ghc` ghc
+    ln -s `which ghc-pkg` ghc-pkg
+
+Next, you need to get ghc-shake into your local package database.
+Easiest way is to create a project.cabal that contains the
+projects you want to build as well as ghc-shake.  Then you can say:
+
+    cabal new-build ghc-shake
+    cabal new-build other-project -w ghc-shake
+
+(Assuming ghc-shake is in your path.)
+
+# What doesn't work
+
+    1. Using --make to link a final executable
+
+    2. hs-boot files
+
+    3. Non-use of -outputdir
+
+If you need something, shout and I'll try to implement it.
