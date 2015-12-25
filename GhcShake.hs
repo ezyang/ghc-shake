@@ -171,10 +171,16 @@ doShake args srcs = do
     -- How to link the top-level thing
     exeFileName staticLink linker_dflags %> \out -> do
         let mainFile = fromJust mb_mainFile
+            -- TODO: hack to get linking with dynamic semi-working.
+            -- TOdO: use maybeMkDynamicDynFlags
+            mkMaybeDynObjPath | WayDyn `elem` ways dflags
+                              = \dflags -> mkObjPath (dynamicTooMkDynamicDynFlags dflags)
+                              | otherwise
+                              = mkObjPath
         -- Need both: the object file for linking, the hi file
         -- to figure out what to link
         need [ mkHiPath  dflags (dropExtension mainFile) "Main",
-               mkObjPath dflags (dropExtension mainFile) "Main" ]
+               mkMaybeDynObjPath dflags (dropExtension mainFile) "Main" ]
         -- Compute the transitive home modules
         main_iface <- liftIO . initIfaceCheck hsc_env
                     $ loadSysInterface (text "linking main") mAIN
@@ -197,7 +203,7 @@ doShake args srcs = do
         getDirectoryFiles "." (map (</> "*") pkg_lib_paths)
         traced "linking" $
             link linker_dflags
-                ((mkObjPath dflags (dropExtension mainFile) "Main")
+                ((mkMaybeDynObjPath dflags (dropExtension mainFile) "Main")
                     : obj_files) pkg_deps
         return ()
 
@@ -223,11 +229,8 @@ doShake args srcs = do
     --
     -- TODO: also pick up C source files here
 
-    let buildHaskell [o, hi] = do
+    let buildHaskell (o:hi:_) = do
         let is_boot = "-boot" `isSuffixOf` hi
-            maybeAddBootSuffix
-                | is_boot   = addBootSuffix
-                | otherwise = id
             maybeAddBootSuffixLocn
                 | is_boot   = addBootSuffixLocn
                 | otherwise = id
@@ -240,7 +243,7 @@ doShake args srcs = do
                     -- "found it" before) but it's not obvious
                     -- what the module name we're trying to build
                     -- is.  So this seems to work ok.
-                    exts = map maybeAddBootSuffix
+                    exts = map (maybeAddBootSuffix is_boot)
                                ["hs", "lhs", "hsig", "lhsig"]
                     search [] = error "Can't find file"
                     search (ext:exts) = do
@@ -287,7 +290,6 @@ doShake args srcs = do
         (dflags', hspp_fn) <- liftIO $ preprocess hsc_env (file, Nothing)
         buf <- liftIO $ hGetStringBuffer hspp_fn
         (srcimps, the_imps, L _ mod_name) <- liftIO $ getImports dflags' buf hspp_fn file
-        putNormal (show location)
         -- TODO: In 7.10 pretty sure hs location is BOGUS
         -- TODO: Pulling out the source timestamp is hella dodgy
         src_timestamp <- liftIO $ getModificationUTCTime file
@@ -359,14 +361,15 @@ doShake args srcs = do
 
         let msg _ _ _ _ = return () -- Be quiet!!
         hmi <- quietly . traced file
-              -- Shake destroyed our exception handler boo hoo
+              -- Shake rethrows exceptions as ShakeExceptions, which
+              -- don't print line numbers.  Handle it here.
               . handle (\(e :: SourceError) -> printBagOfErrors dflags (srcErrorMessages e)
                                             >> error "compileOne'")
               $ compileOne' Nothing (Just msg) hsc_env mod_summary
                             0 0 Nothing Nothing source_unchanged
 
         -- We'd like to add the hmi to the EPS, but this sometimes
-        -- deadlocks.
+        -- deadlocks.  It's not a big deal.
 
         -- Don't add when it's boot.  (Could this cause problems?
         -- I don't think so.)
@@ -376,10 +379,28 @@ doShake args srcs = do
         return ()
 
     -- This ought to be doable with an OR rule
-    [mkObjPath dflags "//*" "//*",
-     mkHiPath  dflags "//*" "//*"] &%> buildHaskell
-    [addBootSuffix (mkObjPath dflags "//*" "//*"),
-     addBootSuffix (mkHiPath  dflags "//*" "//*")] &%> buildHaskell
+    let wildcard dflags is_boot is_dyn mk =
+            maybeAddBootSuffix is_boot
+                (mk (maybeMkDynamicDynFlags is_dyn dflags) "//*" "//*")
+
+        wildcards dflags is_boot is_dyn =
+            map (wildcard dflags is_boot is_dyn) [mkHiPath, mkObjPath]
+
+    -- TODO: dunno if this conditional is right
+    if gopt Opt_BuildDynamicToo dflags
+      then
+        -- Omnibus rule builds dynamic and not-dynamic simultaneously
+        -- NB: non-dynamic first!
+        forM_ [False, True] $ \is_boot ->
+            concatMap (wildcards dflags is_boot) [False, True]
+                &%> buildHaskell
+      else
+        -- Separate rules for each configuration
+        forM_ [False, True] $ \is_boot ->
+            -- TODO: Priority is BIG HACK due to fact that dflags
+            -- is ALREADY dyn-ified EEK!!
+            forM_ [(False, 1), (True, 0)] $ \(is_dyn, p) ->
+                priority p $ wildcards dflags is_boot is_dyn &%> buildHaskell
 
     return ()
 
@@ -425,6 +446,14 @@ doShake args srcs = do
                     output_fn == output_fn3) $ return ()
             -- TODO: read out dependencies from C compiler
 -}
+
+maybeAddBootSuffix is_boot
+    | is_boot   = addBootSuffix
+    | otherwise = id
+
+maybeMkDynamicDynFlags is_dyn
+    | is_dyn = dynamicTooMkDynamicDynFlags
+    | otherwise = id
 
 -----------------------------------------------------------------------
 
