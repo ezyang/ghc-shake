@@ -16,7 +16,6 @@ import SysTools ( newTempName )
 import StringBuffer ( hGetStringBuffer )
 import HeaderInfo ( getImports )
 import PrelNames ( gHC_PRIM, mAIN )
-import HscMain ( hscCompileOneShot )
 import Finder ( addHomeModuleToFinder, mkHomeModLocation )
 import ErrUtils ( printBagOfErrors )
 import Platform ( platformBinariesAreStaticLibs )
@@ -105,6 +104,13 @@ doShake args srcs = do
     hsc_env <- getSession
     liftIO $ do
 
+    case mb_mainFile of
+        Nothing -> return ()
+        Just mainFile -> do
+            location <- mkHomeModLocation dflags (moduleName mAIN) mainFile
+            _ <- liftIO $ addHomeModuleToFinder hsc_env (moduleName mAIN) location
+            return ()
+
     -- Restore normal signal handlers, since we're not GHCi!
     -- TODO: don't try to do this on Windows
     installHandler sigINT Default Nothing
@@ -165,7 +171,10 @@ doShake args srcs = do
     -- How to link the top-level thing
     exeFileName staticLink linker_dflags %> \out -> do
         let mainFile = fromJust mb_mainFile
-        need [ mkHiPath dflags (dropExtension mainFile) "Main" ]
+        -- Need both: the object file for linking, the hi file
+        -- to figure out what to link
+        need [ mkHiPath  dflags (dropExtension mainFile) "Main",
+               mkObjPath dflags (dropExtension mainFile) "Main" ]
         -- Compute the transitive home modules
         main_iface <- liftIO . initIfaceCheck hsc_env
                     $ loadSysInterface (text "linking main") mAIN
@@ -182,6 +191,10 @@ doShake args srcs = do
         let link = case ghcLink dflags of
                 LinkBinary    -> linkBinary
                 other         -> error "don't know how to link this way"
+        -- duplicated from linkBinary' in DriverPipeline
+        pkg_lib_paths <- liftIO $ getPackageLibraryPath dflags pkg_deps
+        -- depend on libraries in the library paths for relink
+        getDirectoryFiles "." (map (</> "*") pkg_lib_paths)
         traced "linking" $
             link linker_dflags
                 ((mkObjPath dflags (dropExtension mainFile) "Main")
@@ -257,9 +270,6 @@ doShake args srcs = do
 
         need [file]
 
-        status_msg <- liftIO $ readIORef statusMsgRef
-        putNormal ("[" ++ status_msg ++ "] GHC " ++ file)
-
         -- OK, let's get scrapping.  This is a duplicate of summariseFile.
         -- TODO: make preprocessing a separate rule.  But how to deal
         -- with dflags modification?!
@@ -292,6 +302,10 @@ doShake args srcs = do
         dep_loc_mods <- getDepLocs finder home_mod_names
         need (map (ml_hi_file . fst) dep_loc_mods)
         -- TODO hs-boot
+
+        -- deps are all built, now report we're doing it
+        status_msg <- liftIO $ readIORef statusMsgRef
+        putNormal ("[" ++ status_msg ++ "] GHC " ++ file)
 
         -- Tricky: where should we get source_unchanged?
         --  - It's unacceptable to say it's always changed, because this
@@ -510,7 +524,7 @@ searchPathExts paths mod exts
                 ]
 
     search [] = return (NotFound { fr_paths = map fst to_search
-                                 , fr_pkg   = Just (modulePackageKey mod)
+                                 , fr_pkg   = Just (moduleUnitId mod)
                                  , fr_mods_hidden = [], fr_pkgs_hidden = []
                                  , fr_suggestions = [] })
 
@@ -556,7 +570,7 @@ guessTarget str Nothing
 haskellish (f,Nothing) =
   looksLikeModuleName f || isHaskellUserSrcFilename f || '.' `notElem` f
 haskellish (_,Just phase) =
-  phase `notElem` [ As True, As False, Cc, Cobjc, Cobjcpp, CmmCpp, Cmm
+  phase `notElem` [ As True, As False, Cc, Cobjc, Cobjcxx, CmmCpp, Cmm
                   , StopLn]
 
 -- getOutputFilename copypasted from DriverPipeline
@@ -644,11 +658,13 @@ mkHiPath dflags basename mod_basename = hi_basename <.> hisuf
                             | otherwise         = basename
 
 -- Copypasted from GhcMake
-home_imps :: [Located (ImportDecl RdrName)] -> [Located ModuleName]
-home_imps imps = [ ideclName i |  L _ i <- imps, isLocal (ideclPkgQual i) ]
+home_imps :: [(Maybe FastString, Located ModuleName)] -> [Located ModuleName]
+home_imps imps = [ lmodname |  (mb_pkg, lmodname) <- imps,
+                                  isLocal mb_pkg ]
   where isLocal Nothing = True
         isLocal (Just pkg) | pkg == fsLit "this" = True -- "this" is special
         isLocal _ = False
+
 
 ms_home_allimps :: ModSummary -> [ModuleName]
 ms_home_allimps ms = map unLoc (ms_home_srcimps ms ++ ms_home_imps ms)
