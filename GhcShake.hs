@@ -223,8 +223,14 @@ doShake args srcs = do
     --
     -- TODO: also pick up C source files here
 
-    [mkObjPath dflags "//*" "//*",
-     mkHiPath  dflags "//*" "//*"] &%> \[o, hi] -> do
+    let buildHaskell [o, hi] = do
+        let is_boot = "-boot" `isSuffixOf` hi
+            maybeAddBootSuffix
+                | is_boot   = addBootSuffix
+                | otherwise = id
+            maybeAddBootSuffixLocn
+                | is_boot   = addBootSuffixLocn
+                | otherwise = id
         location <- case hiDir dflags of
             Nothing -> do
                 -- The destination path tells us directly where
@@ -234,7 +240,8 @@ doShake args srcs = do
                     -- "found it" before) but it's not obvious
                     -- what the module name we're trying to build
                     -- is.  So this seems to work ok.
-                    exts = ["hs", "lhs", "hsig", "lhsig"]
+                    exts = map maybeAddBootSuffix
+                               ["hs", "lhs", "hsig", "lhsig"]
                     search [] = error "Can't find file"
                     search (ext:exts) = do
                         b <- doesFileExist (basePath <.> ext)
@@ -261,12 +268,16 @@ doShake args srcs = do
 
                 r <- finder mod_name
                 case r of
-                    Found loc _ -> return loc
+                    Found loc _ -> return (maybeAddBootSuffixLocn loc)
                     _ -> error ("Could not find source for module " ++ mod_name)
 
         let file = expectJust "shake hi/o rule" (ml_hs_file location)
             (basename, _) = splitExtension file
-            hsc_src = if isHaskellSigFilename file then HsigFile else HsSrcFile
+            hsc_src = if isHaskellSigFilename file
+                        then HsigFile
+                        else if is_boot
+                                then HsBootFile
+                                else HsSrcFile
 
         need [file]
 
@@ -276,10 +287,9 @@ doShake args srcs = do
         (dflags', hspp_fn) <- liftIO $ preprocess hsc_env (file, Nothing)
         buf <- liftIO $ hGetStringBuffer hspp_fn
         (srcimps, the_imps, L _ mod_name) <- liftIO $ getImports dflags' buf hspp_fn file
+        putNormal (show location)
         -- TODO: In 7.10 pretty sure hs location is BOGUS
-        -- TODO: addHomeModuleToFinder?! Hella dodgy.  This has to be run EVERY
-        -- build.
-        -- Hella dodgy
+        -- TODO: Pulling out the source timestamp is hella dodgy
         src_timestamp <- liftIO $ getModificationUTCTime file
         let mod = mkModule (thisPackage dflags) mod_name
             mod_summary = ModSummary {
@@ -301,7 +311,10 @@ doShake args srcs = do
         let home_mod_names = map unLoc (ms_home_imps mod_summary)
         dep_loc_mods <- getDepLocs finder home_mod_names
         need (map (ml_hi_file . fst) dep_loc_mods)
-        -- TODO hs-boot
+
+        let home_boot_names = map unLoc (ms_home_srcimps mod_summary)
+        dep_loc_boots <- getDepLocs finder home_boot_names
+        need (map (ml_hi_file . addBootSuffixLocn . fst ) dep_loc_boots)
 
         -- deps are all built, now report we're doing it
         status_msg <- liftIO $ readIORef statusMsgRef
@@ -354,9 +367,19 @@ doShake args srcs = do
 
         -- We'd like to add the hmi to the EPS, but this sometimes
         -- deadlocks.
-        liftIO $ addHomeModuleToFinder hsc_env mod_name location
+
+        -- Don't add when it's boot.  (Could this cause problems?
+        -- I don't think so.)
+        when (not is_boot) . liftIO $
+            addHomeModuleToFinder hsc_env mod_name location >> return ()
 
         return ()
+
+    -- This ought to be doable with an OR rule
+    [mkObjPath dflags "//*" "//*",
+     mkHiPath  dflags "//*" "//*"] &%> buildHaskell
+    [addBootSuffix (mkObjPath dflags "//*" "//*"),
+     addBootSuffix (mkHiPath  dflags "//*" "//*")] &%> buildHaskell
 
     return ()
 

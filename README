@@ -45,8 +45,8 @@ projects you want to build as well as ghc-shake.  Then you can say:
 
 # What doesn't work
 
-    1. hs-boot files
+    1. Linking things that are not executables
 
-    2. Linking things that are not executables
+    2. Some odd edge-cases for --make
 
 If you need something, shout and I'll try to implement it.
