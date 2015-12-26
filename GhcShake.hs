@@ -173,7 +173,7 @@ doShake args srcs = do
         let mainFile = fromJust mb_mainFile
             -- TODO: hack to get linking with dynamic semi-working.
             -- TOdO: use maybeMkDynamicDynFlags
-            mkMaybeDynObjPath | WayDyn `elem` ways dflags
+            mkMaybeDynObjPath | gopt Opt_BuildDynamicToo dflags
                               = \dflags -> mkObjPath (dynamicTooMkDynamicDynFlags dflags)
                               | otherwise
                               = mkObjPath
@@ -384,7 +384,7 @@ doShake args srcs = do
                 (mk (maybeMkDynamicDynFlags is_dyn dflags) "//*" "//*")
 
         wildcards dflags is_boot is_dyn =
-            map (wildcard dflags is_boot is_dyn) [mkHiPath, mkObjPath]
+            map (wildcard dflags is_boot is_dyn) [mkObjPath, mkHiPath]
 
     -- TODO: dunno if this conditional is right
     if gopt Opt_BuildDynamicToo dflags
@@ -397,10 +397,9 @@ doShake args srcs = do
       else
         -- Separate rules for each configuration
         forM_ [False, True] $ \is_boot ->
-            -- TODO: Priority is BIG HACK due to fact that dflags
-            -- is ALREADY dyn-ified EEK!!
-            forM_ [(False, 1), (True, 0)] $ \(is_dyn, p) ->
-                priority p $ wildcards dflags is_boot is_dyn &%> buildHaskell
+            -- misnomer: this might be dynamic, it might not
+            -- be; they both produce hi/o files
+            wildcards dflags is_boot False &%> buildHaskell
 
     return ()
 

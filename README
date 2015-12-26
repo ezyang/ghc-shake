@@ -47,7 +47,9 @@ projects you want to build as well as ghc-shake.  Then you can say:
 
     1. Linking things that are not executables
 
-    2. Some odd edge-cases for output files in --make (especially
+    2. Profiling (this is a limitation of GHC's plugins support.)
+
+    3. Some odd edge-cases for output files in --make (especially
     for file targets).
 
 If you need something, shout and I'll try to implement it.
