@@ -21,6 +21,7 @@ import ErrUtils ( printBagOfErrors )
 import Platform ( platformBinariesAreStaticLibs )
 import LoadIface ( loadSysInterface )
 import TcRnMonad ( initIfaceCheck )
+import Packages ( lookupModuleWithSuggestions )
 
 import HscTypes
 import InstEnv
@@ -28,6 +29,7 @@ import FamInstEnv
 import Maybes
 import NameEnv
 import Panic
+import Unique
 
 import Development.Shake
 import Development.Shake.Rule
@@ -52,6 +54,21 @@ frontendPlugin :: FrontendPlugin
 frontendPlugin = defaultFrontendPlugin {
         frontend = doShake
     }
+
+-- | A unsafe wrapper that makes things 'Hashable' assuming we have
+-- a 'Uniquable' instance.
+newtype UnsafeUniqueHashable a
+    = UnsafeUniqueHashable { extractUnsafeUniqueHashable :: a }
+    deriving (Eq)
+
+instance Uniquable a => Hashable (UnsafeUniqueHashable a) where
+    -- TODO: salt usage is skeevy, but maybe it doesn't matter
+    hashWithSalt k (UnsafeUniqueHashable a) = getKey (getUnique a) + k
+
+newCacheUnique :: (Eq k, Uniquable k) => (k -> Action v) -> Rules (k -> Action v)
+newCacheUnique f = do
+    cache <- newCache (f . extractUnsafeUniqueHashable)
+    return (cache . UnsafeUniqueHashable)
 
 -----------------------------------------------------------------------
 
@@ -144,20 +161,21 @@ doShake args srcs = do
 
     when (not (null non_hs_srcs)) $ error "non-Haskell source files not supported"
 
+    -- TODO: depend on packagedbs and arguments
+
     -- Reimplemented FinderCache with dependency tracking.
-    finder <- newCache (findHomeModule dflags mb_mainFile)
+    finder <- newCacheUnique (findHomeModule dflags mb_mainFile)
 
     -- Want to build every target a user specified on the command line.
     action $ forM_ targets $ \target -> case target of
         Target{ targetId = TargetModule mod_name } -> do
             -- No point avoiding probing for the source, because we're
             -- going to need it shortly to build the damn thing
-            let mod_name_str = moduleNameString mod_name
-            r <- finder mod_name_str
+            r <- finder mod_name
             case r of
                 -- TODO: -fno-code, should not request object file
                 Found loc _ -> need [ ml_hi_file loc, ml_obj_file loc ]
-                _ -> error ("Could not find module " ++ mod_name_str)
+                _ -> error ("Could not find module " ++ moduleNameString mod_name)
         Target{ targetId = TargetFile file _ } ->
             -- Supporting this in full generality is difficult
             --      * We assume this is for an executable, so only
@@ -258,21 +276,20 @@ doShake args srcs = do
             Just hidir -> do
                 -- Determine the ModuleName
                 let pathToModuleName prefix path = do
-                        path <- stripPrefix prefix path
-                        path <- stripPrefix "/" path `mplus` return path
-                        let (base, ext) = splitExtension (dropWhile isPathSeparator path)
+                        let rel = makeRelative prefix path
+                            (base, ext) = splitExtension (dropWhile isPathSeparator rel)
                             mod_name = map (\c -> if isPathSeparator c then '.' else c) base
                         guard (looksLikeModuleName mod_name)
-                        return mod_name
+                        return (mkModuleName mod_name)
 
-                mod_name <- case pathToModuleName hidir hi of
+                mod_name <- case pathToModuleName (normalise hidir) hi of
                     Nothing -> error ("Not a module name interface file: " ++ hi)
                     Just mod_name -> return mod_name
 
                 r <- finder mod_name
                 case r of
                     Found loc _ -> return (maybeAddBootSuffixLocn loc)
-                    _ -> error ("Could not find source for module " ++ mod_name)
+                    _ -> error ("Could not find source for module " ++ moduleNameString mod_name)
 
         let file = expectJust "shake hi/o rule" (ml_hs_file location)
             (basename, _) = splitExtension file
@@ -460,10 +477,10 @@ maybeMkDynamicDynFlags is_dyn
 
 -----------------------------------------------------------------------
 
-getDepLocs :: (String -> Action FindResult) -> [ModuleName]
+getDepLocs :: (ModuleName -> Action FindResult) -> [ModuleName]
            -> Action [(ModLocation, Module)]
 getDepLocs finder home_mods = do
-    rs <- mapM (finder . moduleNameString) home_mods
+    rs <- mapM finder home_mods
     -- NB: We only need hi files to build, not o files!
     -- TODo: This is not complete; we also have to track the
     -- individual usages.  GHC will give us this information.
@@ -496,13 +513,97 @@ getDepLocs finder home_mods = do
 -- However, finder actions are *build-system* relevant.  So we have
 -- to reimplement them here so that they are properly tracked.
 
+findImportedModule ::
+       (ModuleName -> Action FindResult) -- findHomeModule
+    -> (Module -> Action FindResult)      -- findPackageModule
+    -> DynFlags -> ModuleName -> Maybe FastString -> Action FindResult
+findImportedModule find_home find_package dflags mod_name mb_pkg =
+  case mb_pkg of
+        Nothing                        -> unqual_import
+        Just pkg | pkg == fsLit "this" -> home_import -- "this" is special
+                 | otherwise           -> pkg_import
+  where
+    home_import   = find_home mod_name
+
+    pkg_import    = findExposedPackageModule find_package dflags mod_name mb_pkg
+
+    unqual_import = home_import
+                    `orIfNotFound`
+                    findExposedPackageModule find_package dflags mod_name Nothing
+
+findExposedPackageModule :: (Module -> Action FindResult)
+                         -> DynFlags -> ModuleName -> Maybe FastString
+                         -> Action FindResult
+findExposedPackageModule find_package dflags mod_name mb_pkg
+  = findLookupResult find_package
+  $ lookupModuleWithSuggestions
+        dflags mod_name mb_pkg
+
+findLookupResult :: (Module -> Action FindResult)
+                 -> LookupResult -> Action FindResult
+findLookupResult find_package r = case r of
+     LookupFound m _ -> -- cache interface makes it annoying to pass
+                        -- in auxiliary information
+       find_package m
+     LookupMultiple rs ->
+       return (FoundMultiple rs)
+     LookupHidden pkg_hiddens mod_hiddens ->
+       return (NotFound{ fr_paths = [], fr_pkg = Nothing
+                       , fr_pkgs_hidden = map (moduleUnitId.fst) pkg_hiddens
+                       , fr_mods_hidden = map (moduleUnitId.fst) mod_hiddens
+                       , fr_suggestions = [] })
+     LookupNotFound suggest ->
+       return (NotFound{ fr_paths = [], fr_pkg = Nothing
+                       , fr_pkgs_hidden = []
+                       , fr_mods_hidden = []
+                       , fr_suggestions = suggest })
+
+findPackageModule :: DynFlags -> (Module -> Action FindResult)
+findPackageModule dflags mod = do
+  let
+        pkg_id = moduleUnitId mod
+  --
+  case lookupPackage dflags pkg_id of
+     Nothing -> return (NoPackage pkg_id)
+     Just pkg_conf -> findPackageModule_ dflags mod pkg_conf
+
+findPackageModule_ :: DynFlags -> Module -> PackageConfig -> Action FindResult
+findPackageModule_ dflags mod pkg_conf =
+
+  -- special case for GHC.Prim; we won't find it in the filesystem.
+  if mod == gHC_PRIM
+        then return (Found (error "GHC.Prim ModLocation") mod)
+        else
+
+  let
+     tag = buildTag dflags
+
+           -- hi-suffix for packages depends on the build tag.
+     package_hisuf | null tag  = "hi"
+                   | otherwise = tag ++ "_hi"
+
+     mk_hi_loc f s = mkHiOnlyModLocation dflags package_hisuf f s
+
+     import_dirs = importDirs pkg_conf
+      -- we never look for a .hi-boot file in an external package;
+      -- .hi-boot files only make sense for the home package.
+  in
+  case import_dirs of
+    [one] | MkDepend <- ghcMode dflags -> do
+          -- there's only one place that this .hi file can be, so
+          -- don't bother looking for it.
+          let basename = moduleNameSlashes (moduleName mod)
+              loc = mk_hi_loc one basename
+          return (Found loc mod)
+    _otherwise ->
+          searchPathExts import_dirs mod [(package_hisuf, mk_hi_loc)]
+
 -- NB: mb_mainFile is to tell where to find the Main file.  In general,
 -- ALL file targets could contribute extra found modules, but we're
 -- only supporting main for now.
-findHomeModule :: DynFlags -> Maybe FilePath -> (String -> Action FindResult)
-findHomeModule dflags mb_mainFile str_mod_name =
+findHomeModule :: DynFlags -> Maybe FilePath -> (ModuleName -> Action FindResult)
+findHomeModule dflags mb_mainFile mod_name =
    let
-     mod_name = mkModuleName str_mod_name
      home_path = importPaths dflags
      hisuf = hiSuf dflags
      mod = mkModule (thisPackage dflags) mod_name
@@ -519,7 +620,7 @@ findHomeModule dflags mb_mainFile str_mod_name =
     then return (Found (error "GHC.Prim ModLocation") mod)
     else case mb_mainFile of
             Just mainFile
-                | str_mod_name == "Main" -> do
+                | mod_name == mkModuleName "Main" -> do
                 loc <- liftIO $ mkHomeModLocation dflags (moduleName mAIN) mainFile
                 return (Found loc mAIN)
             _ -> searchPathExts home_path mod exts
@@ -547,6 +648,20 @@ mkHomeModLocation2 dflags mod src_basename ext =
    in (ModLocation{ ml_hs_file   = Just (src_basename <.> ext),
                     ml_hi_file   = hi_fn,
                     ml_obj_file  = obj_fn })
+
+mkHiOnlyModLocation :: DynFlags -> Suffix -> FilePath -> String
+                    -> ModLocation
+mkHiOnlyModLocation dflags hisuf path basename
+    = let full_basename = path </> basename
+          obj_fn = mkObjPath  dflags full_basename basename
+      in ModLocation{    ml_hs_file   = Nothing,
+                             ml_hi_file   = full_basename <.> hisuf,
+                                -- Remove the .hi-boot suffix from
+                                -- hi_file, if it had one.  We always
+                                -- want the name of the real .hi file
+                                -- in the ml_hi_file field.
+                             ml_obj_file  = obj_fn
+                    }
 
 searchPathExts
   :: [FilePath]         -- paths to search
@@ -608,6 +723,19 @@ guessTarget str Nothing
                 | otherwise       = (str,  True)
 
          target tid = Target tid obj_allowed Nothing
+
+-- | If there is no -o option, guess the name of target executable
+-- by using top-level source file name as a base.
+--
+-- Original was in the Ghc monad but we don't want that
+guessOutputFile :: FilePath -> FilePath
+guessOutputFile mainModuleSrcPath =
+    let name = dropExtension mainModuleSrcPath
+    in if name == mainModuleSrcPath
+        then throwGhcException . UsageError $
+                 "default output name would overwrite the input file; " ++
+                 "must specify -o explicitly"
+        else name
 
 -----------------------------------------------------------------------
 
@@ -717,22 +845,28 @@ home_imps imps = [ lmodname |  (mb_pkg, lmodname) <- imps,
         isLocal _ = False
 
 
-ms_home_allimps :: ModSummary -> [ModuleName]
-ms_home_allimps ms = map unLoc (ms_home_srcimps ms ++ ms_home_imps ms)
-
 ms_home_srcimps :: ModSummary -> [Located ModuleName]
 ms_home_srcimps = home_imps . ms_srcimps
 
 ms_home_imps :: ModSummary -> [Located ModuleName]
 ms_home_imps = home_imps . ms_imps
 
--- | If there is no -o option, guess the name of target executable
--- by using top-level source file name as a base.
-guessOutputFile :: FilePath -> FilePath
-guessOutputFile mainModuleSrcPath =
-    let name = dropExtension mainModuleSrcPath
-    in if name == mainModuleSrcPath
-        then throwGhcException . UsageError $
-                 "default output name would overwrite the input file; " ++
-                 "must specify -o explicitly"
-        else name
+-- Copypasted from Finder, and GENERALIZED
+
+orIfNotFound :: Monad m => m FindResult -> m FindResult -> m FindResult
+orIfNotFound this or_this = do
+  res <- this
+  case res of
+    NotFound { fr_paths = paths1, fr_mods_hidden = mh1
+             , fr_pkgs_hidden = ph1, fr_suggestions = s1 }
+     -> do res2 <- or_this
+           case res2 of
+             NotFound { fr_paths = paths2, fr_pkg = mb_pkg2, fr_mods_hidden = mh2
+                      , fr_pkgs_hidden = ph2, fr_suggestions = s2 }
+              -> return (NotFound { fr_paths = paths1 ++ paths2
+                                  , fr_pkg = mb_pkg2 -- snd arg is the package search
+                                  , fr_mods_hidden = mh1 ++ mh2
+                                  , fr_pkgs_hidden = ph1 ++ ph2
+                                  , fr_suggestions = s1  ++ s2 })
+             _other -> return res2
+    _other -> return res
