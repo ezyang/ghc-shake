@@ -55,20 +55,20 @@ frontendPlugin = defaultFrontendPlugin {
         frontend = doShake
     }
 
--- | A unsafe wrapper that makes things 'Hashable' assuming we have
+-- | A wrapper that makes things 'Hashable' assuming we have
 -- a 'Uniquable' instance.
-newtype UnsafeUniqueHashable a
-    = UnsafeUniqueHashable { extractUnsafeUniqueHashable :: a }
+newtype HashableUnique a
+    = HashableUnique { extractHashableUnique :: a }
     deriving (Eq)
 
-instance Uniquable a => Hashable (UnsafeUniqueHashable a) where
+instance Uniquable a => Hashable (HashableUnique a) where
     -- TODO: salt usage is skeevy, but maybe it doesn't matter
-    hashWithSalt k (UnsafeUniqueHashable a) = getKey (getUnique a) + k
+    hashWithSalt k (HashableUnique a) = getKey (getUnique a) + k
 
 newCacheUnique :: (Eq k, Uniquable k) => (k -> Action v) -> Rules (k -> Action v)
 newCacheUnique f = do
-    cache <- newCache (f . extractUnsafeUniqueHashable)
-    return (cache . UnsafeUniqueHashable)
+    cache <- newCache (f . extractHashableUnique)
+    return (cache . HashableUnique)
 
 -----------------------------------------------------------------------
 
@@ -164,14 +164,15 @@ doShake args srcs = do
     -- TODO: depend on packagedbs and arguments
 
     -- Reimplemented FinderCache with dependency tracking.
-    finder <- newCacheUnique (findHomeModule dflags mb_mainFile)
+    find_home    <- newCacheUnique (findHomeModule dflags mb_mainFile)
+    find_package <- newCacheUnique (findPackageModule dflags)
 
     -- Want to build every target a user specified on the command line.
     action $ forM_ targets $ \target -> case target of
         Target{ targetId = TargetModule mod_name } -> do
             -- No point avoiding probing for the source, because we're
             -- going to need it shortly to build the damn thing
-            r <- finder mod_name
+            r <- find_home mod_name
             case r of
                 -- TODO: -fno-code, should not request object file
                 Found loc _ -> need [ ml_hi_file loc, ml_obj_file loc ]
@@ -204,7 +205,7 @@ doShake args srcs = do
                     $ loadSysInterface (text "linking main") mAIN
         let mod_name_deps = map fst . filter (not.snd)
                           . dep_mods . mi_deps $ main_iface
-        dep_loc_mods <- getDepLocs finder mod_name_deps
+        dep_loc_mods <- getDepLocs find_home mod_name_deps
         -- assert dep_loc_mods is all home modules
         let obj_files = map (ml_obj_file . fst) dep_loc_mods
         need obj_files
@@ -286,7 +287,7 @@ doShake args srcs = do
                     Nothing -> error ("Not a module name interface file: " ++ hi)
                     Just mod_name -> return mod_name
 
-                r <- finder mod_name
+                r <- find_home mod_name
                 case r of
                     Found loc _ -> return (maybeAddBootSuffixLocn loc)
                     _ -> error ("Could not find source for module " ++ moduleNameString mod_name)
@@ -325,15 +326,19 @@ doShake args srcs = do
                         ms_obj_date = Nothing
                       }
 
-        -- Add the dependencies
-        -- TODO refactor this with target
-        let home_mod_names = map unLoc (ms_home_imps mod_summary)
-        dep_loc_mods <- getDepLocs finder home_mod_names
-        need (map (ml_hi_file . fst) dep_loc_mods)
+        -- getImportLocs finder the_imps
 
-        let home_boot_names = map unLoc (ms_home_srcimps mod_summary)
-        dep_loc_boots <- getDepLocs finder home_boot_names
-        need (map (ml_hi_file . addBootSuffixLocn . fst ) dep_loc_boots)
+        -- Add the direct dependencies
+        let find_module (mb_pkg, L _ mod_name) =
+                findImportedModule find_home find_package dflags mod_name mb_pkg
+        dep_finds <- mapM find_module the_imps
+        dep_boot_finds <- mapM find_module srcimps
+        let canBuild (Found loc mod) = [ loc ]
+            canBuild _ = [] -- could error early here
+            hi_deps = map ml_hi_file (concatMap canBuild dep_finds)
+            hi_boot_deps = map (ml_hi_file . addBootSuffixLocn)
+                               (concatMap canBuild dep_boot_finds)
+        need (hi_deps ++ hi_boot_deps)
 
         -- deps are all built, now report we're doing it
         status_msg <- liftIO $ readIORef statusMsgRef

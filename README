@@ -52,4 +52,11 @@ projects you want to build as well as ghc-shake.  Then you can say:
     3. Some odd edge-cases for output files in --make (especially
     for file targets).
 
+    4. Recompilation avoidance is still not perfect. Obvious
+    places we can improve:
+
+        - Track flags and package databases
+
+        - Reimplement GHC's recomp avoidance
+
 If you need something, shout and I'll try to implement it.
