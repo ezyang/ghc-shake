@@ -17,12 +17,15 @@ cabal-version:       >=1.10
 
 library
   exposed-modules:     GhcShake
-  -- other-modules:       
+  other-modules:       GhcShakeInstances
+                       Compat
+                       GhcAction
   -- other-extensions:    
   build-depends:       base,
                        ghc == 7.11.*,
                        shake,
                        containers,
+                       binary,
                        unix,
                        directory,
                        filepath

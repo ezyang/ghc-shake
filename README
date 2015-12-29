@@ -27,6 +27,8 @@ Currently, I'm testing on a very specific configuration:
     - Cabal with nix-local-build.  Get it here:
         https://github.com/haskell/cabal/tree/nix-local-build
 
+    - Shake with some bugfixes.
+
 Once you've installed that GHC, make two symlinks in this directory, ghc
 and ghc-pkg, which point to the version of GHC you want to use.  If you've
 added that GHC to your path, these commands will do:
