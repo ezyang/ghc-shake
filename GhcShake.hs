@@ -403,7 +403,9 @@ doShake args srcs = do
     -- This ought to be doable with an OR rule
     let wildcard dflags is_boot is_dyn mk =
             maybeAddBootSuffix is_boot
-                (mk (maybeMkDynamicDynFlags is_dyn dflags) "//*" "//*")
+                -- NB: need a leading dot, otherwise </> truncates
+                -- the directory!
+                (mk (maybeMkDynamicDynFlags is_dyn dflags) ".//*" ".//*")
 
         wildcards dflags is_boot is_dyn =
             map (wildcard dflags is_boot is_dyn) [mkObjPath, mkHiPath]
