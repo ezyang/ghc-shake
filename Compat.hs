@@ -19,7 +19,7 @@ import System.FilePath
 -- copypasted from ghc/Main.hs
 -- TODO: put this in a library
 haskellish (f,Nothing) =
-  looksLikeModuleName f || isHaskellUserSrcFilename f || '.' `notElem` f
+  looksLikeModuleName f || isHaskellSrcFilename f || '.' `notElem` f
 haskellish (_,Just phase) =
   phase `notElem` [ As True, As False, Cc, Cobjc, Cobjcxx, CmmCpp, Cmm
                   , StopLn]

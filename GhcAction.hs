@@ -162,8 +162,8 @@ findPackageModule_ dflags mod pkg_conf =
 -- NB: mb_mainFile is to tell where to find the Main file.  In general,
 -- ALL file targets could contribute extra found modules, but we're
 -- only supporting main for now.
-findHomeModule :: DynFlags -> Maybe FilePath -> (ModuleName -> Action FindResult)
-findHomeModule dflags mb_mainFile mod_name =
+findHomeModule :: DynFlags -> (ModuleNameEnv FilePath) -> (ModuleName -> Action FindResult)
+findHomeModule dflags mod_name_to_file mod_name =
    let
      home_path = importPaths dflags
      hisuf = hiSuf dflags
@@ -179,11 +179,10 @@ findHomeModule dflags mb_mainFile mod_name =
    in
   if mod == gHC_PRIM
     then return (Found (error "GHC.Prim ModLocation") mod)
-    else case mb_mainFile of
-            Just mainFile
-                | mod_name == mkModuleName "Main" -> do
-                loc <- liftIO $ mkHomeModLocation dflags (moduleName mAIN) mainFile
-                return (Found loc mAIN)
+    else case lookupUFM mod_name_to_file mod_name of
+            Just file -> do
+                loc <- liftIO $ mkHomeModLocation dflags mod_name file
+                return (Found loc (mkModule (thisPackage dflags) mod_name))
             _ -> searchPathExts home_path mod exts
 
 
@@ -262,30 +261,6 @@ searchPathExts paths mod exts
       if b
         then return (Found loc mod)
         else search rest
-
--- Reimplemented this because the default algo treats too many things
--- as files
-guessTarget :: GhcMonad m => String -> Maybe Phase -> m Target
-guessTarget str (Just phase)
-   = return (Target (TargetFile str (Just phase)) True Nothing)
-guessTarget str Nothing
-   | isHaskellSrcFilename file
-   = return (target (TargetFile file Nothing))
-   | otherwise
-   = do if looksLikeModuleName file
-           then return (target (TargetModule (mkModuleName file)))
-           else do
-        dflags <- getDynFlags
-        liftIO $ throwGhcExceptionIO
-                 (ProgramError (showSDoc dflags $
-                 text "target" <+> quotes (text file) <+> 
-                 text "is not a module name or a source file"))
-     where
-         (file,obj_allowed)
-                | '*':rest <- str = (rest, False)
-                | otherwise       = (str,  True)
-
-         target tid = Target tid obj_allowed Nothing
 
 -- | If there is no -o option, guess the name of target executable
 -- by using top-level source file name as a base.
