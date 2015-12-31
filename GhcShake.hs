@@ -47,15 +47,25 @@ import Development.Shake
 import Development.Shake.Rule
 import Development.Shake.Classes
 
+-- I'm evil!
+import Development.Shake.Rules.File
+import Development.Shake.ByteString
+import Development.Shake.Core
+import General.String
+
 import GHC.Generics (Generic)
 import System.Posix.Signals
 import qualified Data.Map as Map
+import qualified Data.HashMap.Strict as HashMap
+import Data.Dynamic
+import Data.Bits
 import Data.Map (Map)
 import Data.Typeable
 import Data.List
 import Data.Maybe
 import Data.IORef
 import Data.Tuple
+import Data.Either
 import Control.Monad
 import Control.Concurrent.MVar
 import Control.Exception
@@ -64,6 +74,12 @@ import System.FilePath
 import System.Exit
 import qualified System.Directory as IO
 import qualified Data.IntSet as IntSet
+
+newtype NonHsObjectFiles = NonHsObjectFiles ()
+    deriving (Show, Typeable, Eq, Hashable, Binary, NFData)
+
+newtype NonHsObjectPhase = NonHsObjectPhase String
+    deriving (Show, Typeable, Eq, Hashable, Binary, NFData)
 
 frontendPlugin :: FrontendPlugin
 frontendPlugin = defaultFrontendPlugin {
@@ -78,72 +94,31 @@ frontendPlugin = defaultFrontendPlugin {
 
 doShake :: [String] -> [(String, Maybe Phase)] -> Ghc ()
 doShake args srcs = do
-    -- These will end up being our top-level wants
-    let (hs_srcs, non_hs_srcs) = partition haskellish srcs
-    targets <- mapM (uncurry guessTarget) hs_srcs
-
-    dflags00 <- getDynFlags
-    -- TODO: I'm not sure if this helps
-    let dflags0 = dflags00 {
-                   hiDir = fmap normalise (hiDir dflags00),
-                   objectDir = fmap normalise (objectDir dflags00),
-                   stubDir = fmap normalise (stubDir dflags00),
-                   outputFile = fmap normalise (outputFile dflags00),
-                   includePaths = map normalise (includePaths dflags00),
-                   importPaths = map normalise (importPaths dflags00)
-                }
+    -- Fix up DynFlags to correct form
+    dflags0 <- fmap normaliseDynFlags getDynFlags
     setSessionDynFlags
-        -- Unconditionally turn on -fwrite-interface, otherwise Shake
-        -- has no files to generate!
+        -- HACK: ghc --make -fno-code is not supposed to generate any
+        -- interface files, but this is hard to implement in Shake so I
+        -- am forcing -fwrite-interface in such cases.
         . flip gopt_set Opt_WriteInterface
-        -- ghc --make puts modules in the HPT but this is annoying;
-        -- we'd rather demand load as necessary.  So flip to OneShot
-        -- mode to make this happen.
-        $ dflags0 { ghcMode = OneShot,
-                   importPaths = maybe [] (:[]) (fmap normalise (hiDir dflags0))
-                                    ++ importPaths dflags0,
-                   -- Clear this for normal compilation; we'll
-                   -- reenable it when linking
-                   outputFile = Nothing
-                     }
+        $ oneShotMakeDynFlags dflags0
 
+    -- Get the full DynFlags and HscEnv after fixing DynFlags
     dflags <- getDynFlags
     hsc_env <- getSession
 
-    {-
-    pprTrace "relevant dflags"
-        (vcat [ ppr (mainModIs dflags)
-              , ppr (setSafeMode (safeHaskell dflags))
-              , ppr (fmap fromEnum (language dflags), IntSet.toList $ extensionFlags dflags)
-              , ppr (map normalise (includePaths dflags), opt_P dflags ++ picPOpts dflags)
-              , ppr (hcSuf dflags) ]) $ return ()
-              -}
+    -- The passed in @srcs@ have three functions:
+    --      1. They constitute our top-level 'want's, saying what
+    --         we are going to build,
+    --      2. They tell us where to find source files, which
+    --         may be non-obvious (see 'explicitFileMapping'),
+    --      3. They tell us what to link in.
+    let (hs_srcs, non_hs_srcs) = partition haskellish srcs
+    targets <- mapM (uncurry guessTarget) hs_srcs
 
-    -- File targets are TOTALLY bonkers.  Consider these GHC commands:
-    --
-    --      ghc --make A.hs -outputdir out
-    --      ghc --make A -outputdir out # where A.hs exists
-    --
-    -- These may output to other places than out/A.hi; the target will
-    -- depend on what 'module A' says in the file.  To make matters
-    -- worse, even an input that looks like a module name can be guessed
-    -- to be a TargetFile, if the file exists, so a client can't even be
-    -- sure they managed to force all modules.
-    --
-    -- Thus, for each file target, we have to eagerly parse them for their
-    -- module names, so we know where they're supposed to go.
-    let get_file_target Target { targetId = TargetFile file _ } = Just file
-        get_file_target _ = Nothing
-        file_targets = mapMaybe get_file_target targets
-    mod_name_files <- forM file_targets $ \file -> do
-        -- ahh, it's too bad that we have to redo the preprocessor...
-        (dflags', hspp_fn) <- liftIO $ preprocess hsc_env (file, Nothing)
-        buf <- liftIO $ hGetStringBuffer hspp_fn
-        -- TODO do less work parsing!
-        (_, _, L _ mod_name) <- liftIO $ getImports dflags' buf hspp_fn file
-        location <- liftIO $ mkHomeModLocation dflags mod_name file
-        _ <- liftIO $ addHomeModuleToFinder hsc_env mod_name location
-        return (mod_name, file)
+    -- Compute the 'ModuleName'/'FilePath' mapping based on file targets
+    mod_name_files <- liftIO $ explicitFileMapping hsc_env targets
+    -- TODO: error if there's a clobber
     let mod_name_to_file = listToUFM mod_name_files
         file_to_mod_name = Map.fromList (map swap mod_name_files)
         -- TODO this assumes that main module is always thisPackage,
@@ -151,57 +126,38 @@ doShake args srcs = do
         mb_mainFile = lookupUFM mod_name_to_file (moduleName (mainModIs dflags))
         mb_output_file = fmap guessOutputFile mb_mainFile
 
+    -- Also get the object file mapping based on non-Haskell targets
+    non_hs_o_files <- liftIO $ getNonHsObjectFiles dflags non_hs_srcs
+
+    -- Setup the correctly guessed outputFile for linking
     let linker_dflags = dflags { outputFile =
             case outputFile dflags0 of
                 Nothing -> mb_output_file
                 r -> r
             }
-    let -- copypasted from DriverPipeline.hs
-        staticLink = case ghcLink dflags of
+
+    -- TODO: get rid of me?
+    -- copypasted from DriverPipeline.hs
+    let staticLink = case ghcLink dflags of
                         LinkStaticLib -> True
                         _ -> platformBinariesAreStaticLibs (targetPlatform dflags)
     liftIO $ do
 
-    -- TODO: recomp avoidance here is dodgy
-    -- If you want to build a .o file, it is ambiguous whether or not it
-    -- is a Haskell or C file.  For example:
-    --
-    --      ghc --make A.c A.hs
-    --
-    -- will clobber A.o (GHC's build system does no sanity check here.)
-    -- However, we observe that GHC will never go off and build a
-    -- non-Haskell source manually; it has to be in non_hs_srcs.  So
-    -- for EACH non_hs_srcs, we add a rule for how to build its product,
-    -- with higher priority than the default Haskell rule, and leave
-    -- it at that.  To do that, we have to precompute the output
-    -- filenames of each non_hs_src file.
-    non_hs_o_files <- forM non_hs_srcs $ \(input_fn, mb_phase) -> do
-        -- This code duplicates compileFile hsc_env StopLn x
-        let mb_o_file = outputFile dflags
-            -- Some of these cases should be impossible
-            output
-             -- ToDo: kill this
-             | HscNothing <- hscTarget dflags = Temporary
-             | not (isNoLink (ghcLink dflags)) = Persistent
-             -- ToDo: kill this too
-             | isJust mb_o_file = SpecificFile
-             | otherwise = Persistent
-            (basename, _) = splitExtension input_fn
-            stopPhase = StopLn
-        output_fn <-
-            getOutputFilename stopPhase output basename dflags stopPhase Nothing
-        return ((input_fn, mb_phase), output_fn)
 
     -- Restore normal signal handlers, since we're not GHCi!
+    -- If we don't do this, ^C will not kill us correctly.
     -- TODO: don't try to do this on Windows
     installHandler sigINT Default Nothing
     installHandler sigHUP Default Nothing
     installHandler sigTERM Default Nothing
     installHandler sigQUIT Default Nothing
 
-    statusMsgRef <- newIORef ""
-
+    -- When we run into a GhcException or a SourceError, try to give
+    -- ghc --make compatible output (without the extra Shake wrapping.)
+    -- In fact, we MUST do this because Shake does not print
+    -- line-numbers for SourceErrors.
     handle (\(e :: ShakeException) ->
+                -- TODO: there should be a better way of doing this
                 case fromException (shakeExceptionInner e) of
                     Just (e' :: GhcException) -> throwIO e'
                     Nothing -> case fromException (shakeExceptionInner e) of
@@ -210,51 +166,71 @@ doShake args srcs = do
                 ) $ do
 
     withArgs args $ do
-    shakeArgs shakeOptions {
-        shakeFiles = case hiDir dflags of
-                        Just hidir -> hidir </> ".shake"
-                        Nothing -> ".shake",
-        shakeThreads = fromMaybe 0 (parMakeCount dflags),
-        shakeVersion = "1",
-        shakeVerbosity = case verbosity dflags of
-                            -- Erm, I think this is right
-                            0 -> Quiet
-                            1 -> Normal
-                            2 -> Normal
-                            3 -> Loud
-                            4 -> Chatty
-                            _ -> Diagnostic,
-        shakeLint = Just LintBasic, -- for dev
-        shakeAssume = if gopt Opt_ForceRecomp dflags
-                        then Just AssumeDirty
-                        else Nothing,
-        shakeProgress = progressDisplay 1 (atomicWriteIORef statusMsgRef)
-    } $ do
+    let opts = shakeOptions {
+            -- If we set -outputdir, we should not be influenced by
+            -- build products in the source directory; similarly,
+            -- we should have a different Shake instance in this case.
+            -- Why not objectDir? Well, you've gotta draw the line
+            -- somewhere...
+            shakeFiles = case hiDir dflags of
+                            Just hidir -> hidir </> ".shake"
+                            Nothing -> ".shake",
+            shakeThreads = fromMaybe 0 (parMakeCount dflags),
+            shakeVersion = "1",
+            shakeVerbosity = case verbosity dflags of
+                                -- Erm, I think this is right
+                                0 -> Quiet
+                                1 -> Normal
+                                2 -> Normal -- [sic]
+                                3 -> Loud
+                                4 -> Chatty
+                                _ -> Diagnostic,
+            shakeLint = Just LintBasic, -- for dev
+            shakeAssume = if gopt Opt_ForceRecomp dflags
+                            then Just AssumeDirty
+                            else Nothing,
+            shakeExtra = HashMap.fromList [(typeRep (Proxy :: Proxy DynFlags), toDyn dflags)]
+        }
+    shakeArgs opts $ do
 
-    -- Non-Haskell files:
-    want (map snd non_hs_o_files)
-    forM non_hs_o_files $ \((input_fn, mb_phase), output_fn) -> do
-        output_fn %> \output_fn2 -> do
-            need [input_fn]
-            output_fn3 <- liftIO $ compileFile hsc_env StopLn (input_fn, mb_phase)
-            assert (output_fn == output_fn2 &&
-                    output_fn == output_fn3) $ return ()
-            -- TODO: read out dependencies from C compiler
-
-    -- TODO: depend on packagedbs and arguments
+    -- Non-Haskell files
+    askNonHsObjectFiles <- fmap ($ NonHsObjectFiles ()) . addOracle $
+        \(NonHsObjectFiles ()) -> return non_hs_o_files
+    askNonHsObjectPhase <- fmap (. NonHsObjectPhase) . addOracle $
+        let input_map = Map.fromList (zip non_hs_o_files non_hs_srcs)
+        in \(NonHsObjectPhase input_fn) ->
+            case Map.lookup input_fn input_map of
+                Nothing -> error "askNonHsObjectPhase"
+                Just r -> return r
 
     -- Reimplemented FinderCache with dependency tracking.
+    -- TODO: these should be Oracles!
     find_home    <- newCache (findHomeModule dflags mod_name_to_file)
     find_package <- newCache (findPackageModule dflags)
 
-    -- RecompKey oracle
-    addOracle $ \k -> do
+    -- To make Shake as accurate as possible, we reimplement GHC's
+    -- recompilation avoidance.  The general idea is that while we
+    -- "orderOnly" interface files as a way of telling Shake to go build
+    -- it first, but we only "need" the relevant hashes of interface.
+    -- Thus, Shake will only rebuild when these hashes change.
+    --
+    -- We need some way of key'ing the hashes at the granularity we want to
+    -- manage recompilation avoidance (we don't want to just grab ALL the
+    -- hashes of the interface file because then we'll rebuild too eagerly);
+    -- that's what 'RecompKey' is for.
+    askRecompKey <- addOracle $ \k -> do
         let get_iface mod is_boot = do
                 -- TODO: factor this out
                 -- Just doing this to get accurate tracking
                 r <- findExactModule find_home find_package dflags mod
                 case r of
-                    Found loc _ -> need [ maybeAddBootSuffix is_boot (ml_hi_file loc) ]
+                    Found loc mod ->
+                        -- TODO REFACTOR THIS SNIPPET
+                        case ml_hs_file loc of
+                            Nothing -> need [ maybeAddBootSuffix is_boot (ml_hi_file loc) ]
+                            Just src_file -> do
+                                apply1 (BuildModule src_file mod is_boot) :: Action BuildModuleA
+                                return ()
                     _ -> error "couldn't find module for hash lookup"
                 liftIO . initIfaceCheck hsc_env
                        -- BOGUS, but it's the most convenient way
@@ -276,24 +252,42 @@ doShake args srcs = do
                             Nothing -> fingerprint0
                             Just (_, fp) -> fp
 
+    want non_hs_o_files
+    forM non_hs_o_files $
+        \output_fn -> do
+            output_fn %> \output_fn -> do
+                (input_fn, mb_phase) <- askNonHsObjectPhase output_fn
+                need [input_fn]
+                output_fn2 <- liftIO $
+                    compileFile hsc_env StopLn (input_fn, mb_phase)
+                assert (output_fn == output_fn2) $ return ()
+                -- TODO: read out dependencies from C compiler
+
+    -- TODO: depend on packagedbs and arguments
+
     -- Want to build every target a user specified on the command line.
-    action $ forM_ targets $ \target -> case target of
+    action $ forP targets $ \target -> case target of
         Target{ targetId = TargetModule mod_name } -> do
             -- No point avoiding probing for the source, because we're
             -- going to need it shortly to build the damn thing
             r <- find_home mod_name
             case r of
                 -- TODO: -fno-code, should not request object file
-                Found loc _ ->
-                    if hscTarget dflags == HscNothing
-                        then need [ ml_hi_file loc ]
-                        else need [ ml_hi_file loc, ml_obj_file loc ]
+                Found loc mod ->
+                    case ml_hs_file loc of
+                        Nothing -> need [ ml_hi_file loc ]
+                        Just src_file -> do
+                            apply1 (BuildModule src_file mod False) :: Action BuildModuleA
+                            return ()
                 _ -> error ("Could not find module " ++ moduleNameString mod_name)
         Target{ targetId = TargetFile file _ } ->
             case Map.lookup file file_to_mod_name of
                 Nothing -> error "should not happen"
                 Just mod_name -> do
-                    need [ mkHiPath dflags (dropExtension file) (moduleNameSlashes mod_name) ]
+                    -- TODO: should look at extension to determine
+                    -- booted-ness!!
+                    apply1 (BuildModule file (mkModule (thisPackage dflags) mod_name) False) :: Action BuildModuleA
+                    return ()
 
 
     -- Linking is computed separately
@@ -340,7 +334,7 @@ doShake args srcs = do
         dep_loc_mods <- getDepLocs find_home mod_name_deps
         -- assert dep_loc_mods is all home modules
         let obj_files = map (ml_obj_file . fst) dep_loc_mods
-                     ++ map snd non_hs_o_files -- extra objects
+                     ++ non_hs_o_files -- extra objects
         need obj_files
         let pkg_deps = map fst . dep_pkgs . mi_deps $ main_iface
         -- TODO: this is slightly buggy; if a module is mentioned
@@ -373,66 +367,23 @@ doShake args srcs = do
     --  2. Parse the source file until you get to dependencies,
     --     and require those
     --  3. Build it!
-    --
-    -- This is made further complicated by the fact that -hidir
-    -- and -odir are separate. There are a lot of degrees of freedom.
-    --      - Actually, this is nearly impossible: the rule needs to
-    --      know A PRIORI what file is going to be output.  Which means
-    --      we must scan any explicitly specified files at the beginning.
-    --
-    -- TODO: also pick up C source files here
 
-    let buildHaskell (o:hi:_) = buildHaskell' hi (Just o)
-        buildHaskell [hi] = buildHaskell' hi Nothing
-        buildHaskell' hi mb_o = do
-        let is_boot = "-boot" `isSuffixOf` hi
-            maybeAddBootSuffixLocn
+    rule $ \bm@(BuildModule file mod is_boot) -> Just $ do
+        let maybeAddBootSuffixLocn
                 | is_boot   = addBootSuffixLocn
                 | otherwise = id
-        location <- case hiDir dflags of
-            Nothing -> do
-                -- The destination path tells us directly where
-                -- the source file is
-                let basePath = dropExtension hi
-                    -- We shouldn't have to probe this again (we
-                    -- "found it" before) but it's not obvious
-                    -- what the module name we're trying to build
-                    -- is.  So this seems to work ok.
-                    exts = map (maybeAddBootSuffix is_boot)
-                               -- NB: we need to search more here
-                               -- because we're not consulting the
-                               -- module name to file cache
-                               ["hs", "lhs", "hsig", "lhsig", "hspp", "hscpp"]
-                    search [] = error "Can't find source file"
-                    search (ext:exts) = do
-                        b <- doesFileExist (basePath <.> ext)
-                        if b then return (basePath <.> ext)
-                             else search exts
-                path <- search exts
-                return ModLocation {
-                            ml_hs_file = Just path,
+            -- TODO duped again!!!
+            basename = dropExtension file
+            mod_basename = moduleNameSlashes (moduleName mod)
+            hi     = mkHiPath      dflags basename mod_basename
+            o      = mkObjPath     dflags basename mod_basename
+            location = ModLocation {
+                            ml_hs_file = Just file,
                             ml_hi_file = hi,
-                            ml_obj_file = fromMaybe (error "ml_obj_file mb_o") mb_o }
-            Just hidir -> do
-                -- Determine the ModuleName
-                let pathToModuleName prefix path = do
-                        let rel = makeRelative prefix path
-                            (base, ext) = splitExtension (dropWhile isPathSeparator rel)
-                            mod_name = map (\c -> if isPathSeparator c then '.' else c) base
-                        guard (looksLikeModuleName mod_name)
-                        return (mkModuleName mod_name)
+                            ml_obj_file = o
+                        }
 
-                mod_name <- case pathToModuleName (normalise hidir) hi of
-                    Nothing -> error ("Not a module name interface file: " ++ hi)
-                    Just mod_name -> return mod_name
-
-                r <- find_home mod_name
-                case r of
-                    Found loc _ -> return (maybeAddBootSuffixLocn loc)
-                    _ -> error ("Could not find source for module " ++ moduleNameString mod_name)
-
-        let file = expectJust "shake hi/o rule" (ml_hs_file location)
-            (basename, _) = splitExtension file
+        let (basename, _) = splitExtension file
             hsc_src = if isHaskellSigFilename file
                         then HsigFile
                         else if is_boot
@@ -465,63 +416,41 @@ doShake args srcs = do
                         ms_obj_date = Nothing
                       }
 
-        _ <- askOracle (FlagHash (mod == mainModIs dflags)) :: Action Fingerprint
+        askRecompKey (FlagHash (mod == mainModIs dflags))
 
         -- Add the direct dependencies
         let find_module (mb_pkg, L _ mod_name) =
                 findImportedModule find_home find_package dflags mod_name mb_pkg
         dep_finds <- mapM find_module the_imps
         dep_boot_finds <- mapM find_module srcimps
-        let canBuild (Found loc mod) = [ loc ]
-            canBuild _ = [] -- could error early here
-            hi_deps = map ml_hi_file (concatMap canBuild dep_finds)
-            hi_boot_deps = map (ml_hi_file . addBootSuffixLocn)
-                               (concatMap canBuild dep_boot_finds)
-            o_deps = map ml_obj_file (concatMap canBuild dep_finds)
-            o_boot_deps = map (ml_obj_file . addBootSuffixLocn)
-                               (concatMap canBuild dep_boot_finds)
-        orderOnly (hi_deps ++ hi_boot_deps ++ o_deps ++ o_boot_deps)
+        let canBuild is_boot (Found loc mod) =
+                case ml_hs_file loc of
+                    Nothing -> [Left (ml_hi_file loc)]
+                    Just hs -> [Right (BuildModule hs mod is_boot)]
+            canBuild _ _ = [] -- could error early here
+            deps = concatMap (canBuild False) dep_finds
+            boot_deps = concatMap (canBuild True) dep_boot_finds
+            (external_deps, home_deps) = partitionEithers (deps ++ boot_deps)
+        need external_deps
+        _ <- unsafeIgnoreDependencies $ (apply home_deps :: Action [BuildModuleA])
 
-        -- deps are all built, now report we're doing it
-        -- status_msg <- liftIO $ readIORef statusMsgRef
-        -- putNormal ("[" ++ status_msg ++ "] GHC " ++ file)
+        -- Deps are all built, now report we're building this module
         putNormal ("GHC " ++ file)
-
-        -- Tricky: where should we get source_unchanged?
-        --  - It's unacceptable to say it's always changed, because this
-        --    will thwart GHC's recompilation checker.
-        --  - You can't replace GHC's recompilation checker with Shake,
-        --    because it operates on the level of semantic entities
-        --    while Shake works on files. (With a LOT more coordination
-        --    you could manage it. That would be an interesting thing
-        --    to do.)  To put it another way, Shake's job is to
-        --    handle *stability*.
-        --  - Possibility 1: directly query the o/hi and hs file for
-        --    timestamps and make a determination based on that.
-        --  - Possibility 2: get the info out of Shake.  I don't know
-        --    how to do this.
-        --
-        -- So we'll do possibility 1 first.
-        --
-        -- Careful: Shake's file algorithm is different from stability:
-        -- stability is *transitive* in GHC, while Shake is allowed
-        -- to not recompile if all of the needs did not change.
-        -- We THINK this is equivalent (at least when you're not
-        -- using GHCi, anyway), and ghc -M seems to suggest so too;
-        -- however, a lint or two would be appreciated.
 
         -- copy-pasted from DriverPipeline
         let dest_file | writeInterfaceOnlyMode dflags = hi
-                      | otherwise                     = fromMaybe (error "dest_file") mb_o
+                      | otherwise                     = o
 
         let msg _ _ _ _ = return () -- Be quiet!!
         hmi <- quietly . traced file
               $ compileOne' Nothing (Just msg) hsc_env mod_summary
-                            -- Always report modified! Because we'll
-                            -- have skipped the rule if it hadn't.
-                            -- Importantly, WE CAN SKIP GHC's
-                            -- recompilation checking.
-                            0 0 Nothing Nothing SourceModified
+                            -- We don't know what number the module
+                            -- we're building is
+                            0 0 Nothing Nothing
+                            -- We skip GHC's recompiler checker by
+                            -- passing SourceModified because we
+                            -- reimplemented it
+                            SourceModified
 
         -- Register fine-grained dependencies
         let iface = hm_iface hmi
@@ -545,7 +474,7 @@ doShake args srcs = do
             keys = concatMap usageKey (mi_usages iface)
             files = concatMap usageFile (mi_usages iface)
         -- We could parallelize this but it's kind of pointless
-        forM keys askOracle :: Action [Fingerprint]
+        mapM askRecompKey keys
         need files
 
         -- We'd like to add the hmi to the EPS (so we don't attempt
@@ -557,61 +486,17 @@ doShake args srcs = do
         when (not is_boot) . liftIO $
             addHomeModuleToFinder hsc_env mod_name location >> return ()
 
-        return ()
-
-    -- This ought to be doable with an OR rule
-    let wildcard dflags is_boot is_dyn mk =
-            maybeAddBootSuffix is_boot
-                -- NB: don't use "//*" because then </> will delete
-                -- the prefix!
-                (mk (maybeMkDynamicDynFlags is_dyn dflags) "**/*" "**/*")
-
-        wildcards dflags is_boot is_dyn =
-            map (wildcard dflags is_boot is_dyn) $
-                if hscTarget dflags == HscNothing
-                    then [mkHiPath]
-                    else [mkObjPath, mkHiPath]
-
-    -- TODO: dunno if this conditional is right
-    if gopt Opt_BuildDynamicToo dflags
-      then
-        -- Omnibus rule builds dynamic and not-dynamic simultaneously
-        -- NB: non-dynamic first!
-        forM_ [False, True] $ \is_boot ->
-            concatMap (wildcards dflags is_boot) [False, True]
-                &%> buildHaskell
-      else
-        -- Separate rules for each configuration
-        forM_ [False, True] $ \is_boot ->
-            -- misnomer: this might be dynamic, it might not
-            -- be; they both produce hi/o files
-            wildcards dflags is_boot False &%> buildHaskell
-
-    -----------------------------------------------------------------------
-
-    -- RECOMPILATION AVOIDANCE
-
-    -----------------------------------------------------------------------
-
-    -- To make Shake as accurate as possible, we reimplement GHC's
-    -- recompilation avoidance.  The general idea is that while we
-    -- "need" interface files as a way of telling Shake to go build
-    -- it first, but we'll also "need" relevant hashes of interface
-    -- files to make Shake rebuild when these hashes change.
-    --
-    -- We need some way of key'ing the hashes at the granularity we want to
-    -- manage recompilation avoidance (we don't want to just grab ALL the
-    -- hashes of the interface file because then we'll rebuild too eagerly);
-    -- that's what 'RecompKey' is for.  Irritatingly, none of GHC's
-    -- built-in types have the instances we need so we have to define
-    -- them.
-    --
-    -- Notably, here are things we don't need to check:
-    --
-    --      - Imported module not found among previous dependencies.
-    --        TODO: Handle queries to the package database elsewhere.
-    --
-    --      - File hashes: plain old Shake dependencies work great!
+        -- OK, compute the up-to-date BuildModuleA
+        -- The idea is that if we recompiled, this invalidates ANY build
+        -- products we didn't actually build
+        r <- liftIO $ storedValue opts bm
+        let coverUpObj | hscTarget dflags == HscNothing = \bma -> bma { bma_o = Nothing }
+                       | otherwise = id
+            coverUpDyn | gopt Opt_BuildDynamicToo dflags = id
+                       | otherwise = \bma -> bma { bma_dyn_hi = Nothing, bma_dyn_o = Nothing }
+        case r of
+            Nothing -> error "eek!"
+            Just ans -> return (coverUpDyn (coverUpObj ans))
 
     return ()
 
@@ -635,6 +520,120 @@ maybeMkDynamicDynFlags is_dyn
 
 -----------------------------------------------------------------------
 
+-- Remove any "." directory components from paths in 'DynFlags', to
+-- help prevent Shake from getting confused (since it doesn't
+-- normalise.)
+-- TODO: I'm not sure if this helps
+normaliseDynFlags :: DynFlags -> DynFlags
+normaliseDynFlags dflags =
+    dflags {
+       hiDir = fmap normalise (hiDir dflags),
+       objectDir = fmap normalise (objectDir dflags),
+       stubDir = fmap normalise (stubDir dflags),
+       outputFile = fmap normalise (outputFile dflags),
+       includePaths = map normalise (includePaths dflags),
+       importPaths = map normalise (importPaths dflags)
+    }
+
+-- | @ghc --make@ puts modules in the HPT but this is annoying
+-- to do in Shake, where we don't know the transitive closure
+-- of home modules we depend on; demand loading is much
+-- more convenient.  The only way to demand load home modules
+-- is to be in one-shot mode; this function switches us to
+-- 'OneShot' mode, but makes some adjustments to make it simulate
+-- @--make@ mode.
+oneShotMakeDynFlags :: DynFlags -> DynFlags
+oneShotMakeDynFlags dflags =
+    dflags { ghcMode = OneShot
+             -- As a consequence of being in OneShot mode,
+             -- the Finder doesn't search the output hi directory
+             -- for interface files.  So this is a gentle hack
+             -- to make it search those directories too.
+           , importPaths = maybe [] (:[]) (hiDir dflags)
+                              ++ importPaths dflags
+             -- Another consequence of OneShot mode is that it
+             -- will take the setting of outputFile seriously;
+             -- however, we only really want that when linking.
+             -- So unset outputFile for now.
+           , outputFile = Nothing
+           }
+
+-- | This function computes an association list between module
+-- names and file paths based on any file targets that were passed
+-- to GHC explicitly.
+--
+-- The reason we need to do this is that what file target we specify
+-- can influence what hi/o file generates a source file.  For example,
+-- suppose we have two files:
+--
+-- @
+--      -- A1.hs
+--      module A where
+--
+--      -- A2.hs
+--      module A where
+-- @
+--
+-- If we run @ghc --make A1.hs -outputdir out@, @A1.hs@ is used to buld
+-- @out/A.hi@.  But if we say @ghc --make A2.hs -outputdir out@ instead,
+-- @A2.hs@ will be used instead!  (GHC will in fact silently clobber
+-- files if you specify both at the same time, see
+-- https://ghc.haskell.org/trac/ghc/ticket/11201)
+--
+-- What does this mean for Shake?  First, if we are asked to build some
+-- 'ModuleName', to figure out what source file may have generated it,
+-- we have to look at the file targets (parsing them to get the
+-- module header) to see if any of them define the module in question.
+-- Second, we need to make sure that we recompile if the file arguments
+-- change in a way that causes the source file we should use to
+-- change (normal recompilation checking will NOT catch this!)
+--
+-- At the moment, we eagerly parse each file target to pull out its
+-- module name, and return an association list to handle this.
+--
+-- TODO: Recompilation checking here is broken.
+explicitFileMapping :: HscEnv -> [Target] -> IO [(ModuleName, FilePath)]
+explicitFileMapping hsc_env targets = do
+    let dflags = hsc_dflags hsc_env
+        get_file_target Target { targetId = TargetFile file _ } = Just file
+        get_file_target _ = Nothing
+        file_targets = mapMaybe get_file_target targets
+    forM file_targets $ \file -> do
+        -- ahh, it's too bad that we have to redo the preprocessor...
+        (dflags', hspp_fn) <- preprocess hsc_env (file, Nothing)
+        buf <- hGetStringBuffer hspp_fn
+        -- TODO do less work parsing!
+        (_, _, L _ mod_name) <- getImports dflags' buf hspp_fn file
+        location <- mkHomeModLocation dflags mod_name file
+        _ <- addHomeModuleToFinder hsc_env mod_name location
+        return (mod_name, file)
+
+
+-- If you want to build a .o file, it is ambiguous whether or not it
+-- is a Haskell or C file.  For example:
+--
+--      ghc --make A.c A.hs
+--
+-- will clobber A.o (GHC's build system does no sanity check here.)
+-- However, we observe that GHC will never go off and build a
+-- non-Haskell source manually; it has to be in non_hs_srcs.  So
+-- for EACH non_hs_srcs, we add a rule for how to build its product,
+-- with higher priority than the default Haskell rule, and leave
+-- it at that.  To do that, we have to precompute the output
+-- filenames of each non_hs_src file.
+getNonHsObjectFiles :: DynFlags -> [(FilePath, Maybe Phase)]
+                    -> IO [FilePath]
+getNonHsObjectFiles dflags non_hs_srcs =
+    forM non_hs_srcs $ \(input_fn, mb_phase) -> do
+        -- This code was based off of @compileFile hsc_env StopLn x@
+        let -- Technically -fno-code should cause a temporary file to
+            -- be made, but making this deterministic is better
+            output = Persistent
+            (basename, _) = splitExtension input_fn
+            stopPhase = StopLn
+        getOutputFilename stopPhase output basename dflags stopPhase Nothing
+
+-- TODO: get rid of me
 getDepLocs :: (ModuleName -> Action FindResult) -> [ModuleName]
            -> Action [(ModLocation, Module)]
 getDepLocs finder home_mods = do
@@ -647,4 +646,71 @@ getDepLocs finder home_mods = do
         canBuild _ = []
     return $ concatMap canBuild rs
 
+-- The goods
 
+data BuildModuleA = BuildModuleA
+    { bma_hi     :: Maybe FileA
+    , bma_o      :: Maybe FileA
+    , bma_dyn_hi :: Maybe FileA
+    , bma_dyn_o  :: Maybe FileA
+    }
+    deriving (Eq, Generic, Typeable, Show)
+instance Binary BuildModuleA
+instance NFData BuildModuleA
+instance Hashable BuildModuleA
+
+shakeDynFlags :: ShakeOptions -> DynFlags
+shakeDynFlags opts =
+    case HashMap.lookup (typeRep (Proxy :: Proxy DynFlags)) (shakeExtra opts) of
+        Nothing -> error "no DynFlags"
+        Just d -> case fromDynamic d of
+                    Just dflags -> dflags
+                    Nothing -> error "bad type"
+
+-- This is similar to the Files rule, but it is a bit more relaxed
+-- about what should happen if things are missing depending on
+-- the presence of the @-dynamic-too@ flag.
+instance Rule BuildModule BuildModuleA where
+    -- TODO src_filename here is WRONG
+    storedValue opts (BuildModule src_filename mod is_boot) = do
+        -- Need the DynFlags to compute the paths
+        let dflags = shakeDynFlags opts
+            basename = dropExtension src_filename
+            mod_basename = moduleNameSlashes (moduleName mod)
+            dyn_dflags = dynamicTooMkDynamicDynFlags dflags
+            hi     = mkHiPath      dflags basename mod_basename
+            o      = mkObjPath     dflags basename mod_basename
+            dyn_hi = mkHiPath  dyn_dflags basename mod_basename
+            dyn_o  = mkObjPath dyn_dflags basename mod_basename
+            mkFileQ = FileQ . packU_ . filepathNormalise . unpackU_ . packU
+        mb_hi       <- storedValue opts (mkFileQ hi)
+        mb_o        <- storedValue opts (mkFileQ o)
+        mb_dyn_hi   <- storedValue opts (mkFileQ dyn_hi)
+        mb_dyn_o    <- storedValue opts (mkFileQ dyn_o)
+        return (Just (BuildModuleA mb_hi mb_o mb_dyn_hi mb_dyn_o))
+    equalValue opts (BuildModule src_filename mod is_boot) v1 v2 =
+        -- TODO dedupe
+        let dflags = shakeDynFlags opts
+            basename = dropExtension src_filename
+            mod_basename = moduleNameSlashes (moduleName mod)
+            dyn_dflags = dynamicTooMkDynamicDynFlags dflags
+            hi     = mkHiPath      dflags basename mod_basename
+            o      = mkObjPath     dflags basename mod_basename
+            dyn_hi = mkHiPath  dyn_dflags basename mod_basename
+            dyn_o  = mkObjPath dyn_dflags basename mod_basename
+            mkFileQ = FileQ . packU_ . filepathNormalise . unpackU_ . packU
+        in foldr and_ EqualCheap
+            $ [ test (mkFileQ hi) bma_hi ]
+           ++ if hscTarget dflags == HscNothing
+                then []
+                else [ test (mkFileQ o) bma_o ]
+                  ++ if gopt Opt_BuildDynamicToo dflags
+                        then [ test (mkFileQ dyn_hi) bma_dyn_hi
+                             , test (mkFileQ dyn_o) bma_dyn_o ]
+                        else []
+      where test k sel = case equalValue opts k <$> sel v1 <*> sel v2 of
+                            Nothing -> NotEqual
+                            Just r -> r
+            and_ NotEqual x = NotEqual
+            and_ EqualCheap x = x
+            and_ EqualExpensive x = if x == NotEqual then NotEqual else EqualExpensive

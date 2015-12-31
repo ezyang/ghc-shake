@@ -27,6 +27,7 @@ library
                        containers,
                        binary,
                        unix,
+                       unordered-containers,
                        directory,
                        filepath
   -- hs-source-dirs:      
