@@ -152,18 +152,7 @@ doShake args srcs = do
     installHandler sigTERM Default Nothing
     installHandler sigQUIT Default Nothing
 
-    -- When we run into a GhcException or a SourceError, try to give
-    -- ghc --make compatible output (without the extra Shake wrapping.)
-    -- In fact, we MUST do this because Shake does not print
-    -- line-numbers for SourceErrors.
-    handle (\(e :: ShakeException) ->
-                -- TODO: there should be a better way of doing this
-                case fromException (shakeExceptionInner e) of
-                    Just (e' :: GhcException) -> throwIO e'
-                    Nothing -> case fromException (shakeExceptionInner e) of
-                        Just (e' :: SourceError) -> throwIO e'
-                        Nothing -> throwIO e
-                ) $ do
+    handleGhcErrors $ do
 
     withArgs args $ do
     let opts = shakeOptions {
@@ -220,18 +209,7 @@ doShake args srcs = do
     -- that's what 'RecompKey' is for.
     askRecompKey <- addOracle $ \k -> do
         let get_iface mod is_boot = do
-                -- TODO: factor this out
-                -- Just doing this to get accurate tracking
-                r <- findExactModule find_home find_package dflags mod
-                case r of
-                    Found loc mod ->
-                        -- TODO REFACTOR THIS SNIPPET
-                        case ml_hs_file loc of
-                            Nothing -> need [ maybeAddBootSuffix is_boot (ml_hi_file loc) ]
-                            Just src_file -> do
-                                apply1 (BuildModule src_file mod is_boot) :: Action BuildModuleA
-                                return ()
-                    _ -> error "couldn't find module for hash lookup"
+                needModule find_home find_package dflags mod is_boot
                 liftIO . initIfaceCheck hsc_env
                        -- BOGUS, but it's the most convenient way
                        -- to pass in boot-edness without mucking
@@ -633,6 +611,21 @@ getNonHsObjectFiles dflags non_hs_srcs =
             stopPhase = StopLn
         getOutputFilename stopPhase output basename dflags stopPhase Nothing
 
+handleGhcErrors :: IO a -> IO a
+handleGhcErrors m =
+    -- When we run into a GhcException or a SourceError, try to give
+    -- ghc --make compatible output (without the extra Shake wrapping.)
+    -- In fact, we MUST do this because Shake does not print
+    -- line-numbers for SourceErrors.
+    handle (\(e :: ShakeException) ->
+                -- TODO: there should be a better way of doing this
+                case fromException (shakeExceptionInner e) of
+                    Just (e' :: GhcException) -> throwIO e'
+                    Nothing -> case fromException (shakeExceptionInner e) of
+                        Just (e' :: SourceError) -> throwIO e'
+                        Nothing -> throwIO e
+                ) m
+
 -- TODO: get rid of me
 getDepLocs :: (ModuleName -> Action FindResult) -> [ModuleName]
            -> Action [(ModLocation, Module)]
@@ -714,3 +707,17 @@ instance Rule BuildModule BuildModuleA where
             and_ NotEqual x = NotEqual
             and_ EqualCheap x = x
             and_ EqualExpensive x = if x == NotEqual then NotEqual else EqualExpensive
+
+needModule :: (ModuleName -> Action FindResult)
+           -> (Module -> Action FindResult)
+           -> DynFlags -> Module -> IsBoot -> Action ()
+needModule find_home find_package dflags mod is_boot = do
+    r <- findExactModule find_home find_package dflags mod
+    case r of
+        Found loc mod ->
+            case ml_hs_file loc of
+                Nothing -> need [ maybeAddBootSuffix is_boot (ml_hi_file loc) ]
+                Just src_file -> do
+                    apply1 (BuildModule src_file mod is_boot) :: Action BuildModuleA
+                    return ()
+        _ -> error "couldn't find module for hash lookup"
