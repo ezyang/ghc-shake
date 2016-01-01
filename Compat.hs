@@ -1,8 +1,7 @@
 module Compat where
 
 import GhcPlugins
-import HscTypes
-import DriverPhases ( Phase(..), isHaskellUserSrcFilename, isHaskellSigFilename
+import DriverPhases ( Phase(..)
                     , phaseInputExt, eqPhase, isHaskellSrcFilename )
 import PipelineMonad ( PipelineOutput(..) )
 import SysTools ( newTempName )
@@ -16,9 +15,9 @@ import System.FilePath
 
 -----------------------------------------------------------------------
 
-
 -- copypasted from ghc/Main.hs
 -- TODO: put this in a library
+haskellish :: (String, Maybe Phase) -> Bool
 haskellish (f,Nothing) =
   looksLikeModuleName f || isHaskellSrcFilename f || '.' `notElem` f
 haskellish (_,Just phase) =

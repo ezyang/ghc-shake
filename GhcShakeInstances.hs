@@ -9,14 +9,12 @@ module GhcShakeInstances where
 
 import GhcPlugins hiding (varName)
 import Fingerprint
-import HscTypes
 import Unique
 import OccName
 import DriverPhases
 
 import GHC.Generics (Generic)
 
-import Development.Shake.Rule
 import Development.Shake.Classes
 import Data.Binary (getWord8, putWord8)
 
