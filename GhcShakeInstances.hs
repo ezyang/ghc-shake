@@ -18,6 +18,9 @@ import GHC.Generics (Generic)
 import Development.Shake.Classes
 import Data.Binary (getWord8, putWord8)
 
+-- A really useful typedef
+type IsBoot = Bool
+
 -- UnitId
 instance Show UnitId where
     show = unitIdString
@@ -118,22 +121,6 @@ deriving instance Typeable Phase
 instance NFData Phase
 instance Binary Phase
 instance Hashable Phase
-
--- | A 'BuildModule' is a key for module which can be built.  Unlike
--- in 'GhcMake', we also store the source filename (because a module
--- may be implemented multiple times by different source files.)
-data BuildModule
-    = BuildModule {
-        bm_filename :: FilePath,
-        bm_mod :: Module,
-        bm_is_boot :: IsBoot
-        }
-    deriving (Show, Typeable, Eq, Generic)
-type IsBoot = Bool
-
-instance Hashable BuildModule
-instance Binary BuildModule
-instance NFData BuildModule
 
 -- | A 'RecompKey' is a key for a hash, for which recompilation can
 -- be predicated on.  Each hash represents some aspect of a module

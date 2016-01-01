@@ -21,6 +21,7 @@ library
                        Compat
                        GhcAction
                        PersistentCache
+                       BuildModule
   -- other-extensions:    
   build-depends:       base,
                        ghc == 7.11.*,
