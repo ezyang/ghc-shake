@@ -1,4 +1,4 @@
-{-# OPTIONS_GHC -fno-warn-orphan-instances #-}
+{-# OPTIONS_GHC -fno-warn-orphans #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE DeriveGeneric #-}
