@@ -39,7 +39,6 @@ import System.Posix.Signals
 import qualified Data.Map as Map
 import qualified Data.HashMap.Strict as HashMap
 import Data.Dynamic
-import Data.Map (Map)
 import Data.List
 import Data.Tuple
 import Control.Monad
@@ -246,8 +245,10 @@ doShake args srcs = do
                 (ml_obj_file (fst main_find) : obj_files) pkg_deps
         return ()
 
-    buildModuleRule $ \bm@(BuildModule file mod is_boot) -> do
+    buildModuleRule $ \bm@(BuildModule raw_file mod is_boot) -> do
 
+        -- This is annoying
+        let file = if is_boot then addBootSuffix raw_file else raw_file
         need [file]
 
         -- TODO: make preprocessing a separate rule.  But how to deal
@@ -469,7 +470,7 @@ needHomeModule mod_name =
 -- | Depend on the build products of a file target.
 needFileTarget :: DynFlags -> FilePath
                -> Action (Maybe (ModLocation, Module))
-needFileTarget dflags file =
+needFileTarget dflags file = do
     mod_name <- askFileModuleName file
     let is_boot = "-boot" `isSuffixOf` file
         mod = mkModule (thisPackage dflags) mod_name

@@ -35,6 +35,8 @@ import System.FilePath
 -- | A 'BuildModule' is a key for module which can be built.  Unlike
 -- in 'GhcMake', we also store the source filename (because a module
 -- may be implemented multiple times by different source files.)
+--
+-- NB: the filename is ALWAYS for the non-boot version of the file.
 data BuildModule
     = BuildModule {
         bm_filename :: FilePath,
@@ -146,6 +148,7 @@ instance Rule BuildModule BuildModuleA where
                 then []
                 else [ test (mkFileQ (ml_obj_file loc)) bma_o ]
                   ++ if gopt Opt_BuildDynamicToo dflags
+                            && not (bm_is_boot bm) -- Workaround for https://ghc.haskell.org/trac/ghc/ticket/11327#ticket
                         then [ test (mkFileQ (ml_hi_file dyn_loc))  bma_dyn_hi
                              , test (mkFileQ (ml_obj_file dyn_loc)) bma_dyn_o ]
                         else []
