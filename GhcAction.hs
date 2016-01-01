@@ -66,74 +66,56 @@ import qualified System.Directory as IO
 -- However, finder actions are *build-system* relevant.  So we have
 -- to reimplement them here so that they are properly tracked.
 
-findImportedModule ::
-       (ModuleName -> Action FindResult) -- findHomeModule
-    -> (Module -> Action FindResult)      -- findPackageModule
-    -> DynFlags -> ModuleName -> Maybe FastString -> Action FindResult
-findImportedModule find_home find_package dflags mod_name mb_pkg =
+findImportedModule :: DynFlags -> ModuleName -> Maybe FastString
+                    -> Action (Maybe (ModLocation, Module))
+findImportedModule dflags mod_name mb_pkg =
   case mb_pkg of
         Nothing                        -> unqual_import
         Just pkg | pkg == fsLit "this" -> home_import -- "this" is special
                  | otherwise           -> pkg_import
   where
-    home_import   = find_home mod_name
+    home_import   = findHomeModule mod_name
 
-    pkg_import    = findExposedPackageModule find_package dflags mod_name mb_pkg
+    pkg_import    = findExposedPackageModule dflags mod_name mb_pkg
 
-    unqual_import = home_import
+    unqual_import = findHomeModule mod_name
                     `orIfNotFound`
-                    findExposedPackageModule find_package dflags mod_name Nothing
+                    findExposedPackageModule dflags mod_name Nothing
 
-findExactModule :: (ModuleName -> Action FindResult)
-                -> (Module -> Action FindResult)
-                -> DynFlags -> Module -> Action FindResult
-findExactModule find_home find_package dflags mod =
+findExactModule :: DynFlags -> Module -> Action (Maybe (ModLocation, Module))
+findExactModule dflags mod =
     if moduleUnitId mod == thisPackage dflags
-       then find_home (moduleName mod)
-       else find_package mod
+       then findHomeModule (moduleName mod)
+       else findPackageModule mod
 
-findExposedPackageModule :: (Module -> Action FindResult)
-                         -> DynFlags -> ModuleName -> Maybe FastString
-                         -> Action FindResult
-findExposedPackageModule find_package dflags mod_name mb_pkg
-  = findLookupResult find_package
-  $ lookupModuleWithSuggestions
-        dflags mod_name mb_pkg
+findExposedPackageModule :: DynFlags -> ModuleName -> Maybe FastString
+                         -> Action (Maybe (ModLocation, Module))
+findExposedPackageModule dflags mod_name mb_pkg =
+    -- oracle interface makes it annoying to pass
+    -- in auxiliary information
+    case lookupModuleWithSuggestions dflags mod_name mb_pkg of
+        LookupFound m _  -> findPackageModule m
+        _                -> return Nothing
 
-findLookupResult :: (Module -> Action FindResult)
-                 -> LookupResult -> Action FindResult
-findLookupResult find_package r = case r of
-     LookupFound m _ -> -- cache interface makes it annoying to pass
-                        -- in auxiliary information
-       find_package m
-     LookupMultiple rs ->
-       return (FoundMultiple rs)
-     LookupHidden pkg_hiddens mod_hiddens ->
-       return (NotFound{ fr_paths = [], fr_pkg = Nothing
-                       , fr_pkgs_hidden = map (moduleUnitId.fst) pkg_hiddens
-                       , fr_mods_hidden = map (moduleUnitId.fst) mod_hiddens
-                       , fr_suggestions = [] })
-     LookupNotFound suggest ->
-       return (NotFound{ fr_paths = [], fr_pkg = Nothing
-                       , fr_pkgs_hidden = []
-                       , fr_mods_hidden = []
-                       , fr_suggestions = suggest })
+findPackageModule :: Module -> Action (Maybe (ModLocation, Module))
+findPackageModule = askOracle
 
-findPackageModule :: DynFlags -> (Module -> Action FindResult)
-findPackageModule dflags mod = do
+-- I'M AN ORACLE
+findPackageModule' :: DynFlags -> (Module -> Action (Maybe (ModLocation, Module)))
+findPackageModule' dflags mod = do
   let
         pkg_id = moduleUnitId mod
   --
   case lookupPackage dflags pkg_id of
-     Nothing -> return (NoPackage pkg_id)
+     Nothing -> return Nothing
      Just pkg_conf -> findPackageModule_ dflags mod pkg_conf
 
-findPackageModule_ :: DynFlags -> Module -> PackageConfig -> Action FindResult
+findPackageModule_ :: DynFlags -> Module -> PackageConfig -> Action (Maybe (ModLocation, Module))
 findPackageModule_ dflags mod pkg_conf =
 
   -- special case for GHC.Prim; we won't find it in the filesystem.
   if mod == gHC_PRIM
-        then return (Found (error "GHC.Prim ModLocation") mod)
+        then return (Just (ModLocation Nothing "fake.GHC.Prim" "fake.GHC.Prim", mod))
         else
 
   let
@@ -155,15 +137,17 @@ findPackageModule_ dflags mod pkg_conf =
           -- don't bother looking for it.
           let basename = moduleNameSlashes (moduleName mod)
               loc = mk_hi_loc one basename
-          return (Found loc mod)
+          return (Just (loc, mod))
     _otherwise ->
           searchPathExts import_dirs mod [(package_hisuf, mk_hi_loc)]
 
--- NB: mb_mainFile is to tell where to find the Main file.  In general,
--- ALL file targets could contribute extra found modules, but we're
--- only supporting main for now.
-findHomeModule :: DynFlags -> (ModuleNameEnv FilePath) -> (ModuleName -> Action FindResult)
-findHomeModule dflags mod_name_to_file mod_name =
+findHomeModule :: ModuleName -> Action (Maybe (ModLocation, Module))
+findHomeModule = askOracle
+
+-- I'M AN ORACLE
+findHomeModule' :: DynFlags -> (ModuleNameEnv FilePath)
+                -> (ModuleName -> Action (Maybe (ModLocation, Module)))
+findHomeModule' dflags mod_name_to_file mod_name =
    let
      home_path = importPaths dflags
      hisuf = hiSuf dflags
@@ -178,14 +162,12 @@ findHomeModule dflags mod_name_to_file mod_name =
 
    in
   if mod == gHC_PRIM
-    then return (Found (error "GHC.Prim ModLocation") mod)
+    then return (Just (ModLocation Nothing "fake.GHC.Prim" "fake.GHC.Prim", mod))
     else case lookupUFM mod_name_to_file mod_name of
             Just file -> do
                 loc <- liftIO $ mkHomeModLocation dflags mod_name file
-                return (Found loc (mkModule (thisPackage dflags) mod_name))
+                return (Just (loc, (mkModule (thisPackage dflags) mod_name)))
             _ -> searchPathExts home_path mod exts
-
-
 
 type FileExt = String
 type BaseName = String
@@ -233,7 +215,7 @@ searchPathExts
         FilePath -> BaseName -> ModLocation  -- action
        )
      ]
-  -> Action FindResult
+  -> Action (Maybe (ModLocation, Module))
 
 searchPathExts paths mod exts
    = do result <- search to_search
@@ -251,15 +233,12 @@ searchPathExts paths mod exts
                       file = base <.> ext
                 ]
 
-    search [] = return (NotFound { fr_paths = map fst to_search
-                                 , fr_pkg   = Just (moduleUnitId mod)
-                                 , fr_mods_hidden = [], fr_pkgs_hidden = []
-                                 , fr_suggestions = [] })
+    search [] = return Nothing
 
     search ((file, loc) : rest) = do
       b <- doesFileExist file
       if b
-        then return (Found loc mod)
+        then return (Just (loc, mod))
         else search rest
 
 -- | If there is no -o option, guess the name of target executable
@@ -274,3 +253,10 @@ guessOutputFile mainModuleSrcPath =
                  "default output name would overwrite the input file; " ++
                  "must specify -o explicitly"
         else name
+
+orIfNotFound :: Monad m => m (Maybe a) -> m (Maybe a) -> m (Maybe a)
+orIfNotFound this or_this = do
+  res <- this
+  case res of
+    Nothing -> or_this
+    _ -> return res

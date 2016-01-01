@@ -6,6 +6,7 @@ import DriverPhases ( Phase(..), isHaskellUserSrcFilename, isHaskellSigFilename
                     , phaseInputExt, eqPhase, isHaskellSrcFilename )
 import PipelineMonad ( PipelineOutput(..) )
 import SysTools ( newTempName )
+import qualified Binary as B
 
 import System.FilePath
 
@@ -123,22 +124,9 @@ ms_home_srcimps = home_imps . ms_srcimps
 ms_home_imps :: ModSummary -> [Located ModuleName]
 ms_home_imps = home_imps . ms_imps
 
--- Copypasted from Finder, and GENERALIZED
-
-orIfNotFound :: Monad m => m FindResult -> m FindResult -> m FindResult
-orIfNotFound this or_this = do
-  res <- this
-  case res of
-    NotFound { fr_paths = paths1, fr_mods_hidden = mh1
-             , fr_pkgs_hidden = ph1, fr_suggestions = s1 }
-     -> do res2 <- or_this
-           case res2 of
-             NotFound { fr_paths = paths2, fr_pkg = mb_pkg2, fr_mods_hidden = mh2
-                      , fr_pkgs_hidden = ph2, fr_suggestions = s2 }
-              -> return (NotFound { fr_paths = paths1 ++ paths2
-                                  , fr_pkg = mb_pkg2 -- snd arg is the package search
-                                  , fr_mods_hidden = mh1 ++ mh2
-                                  , fr_pkgs_hidden = ph1 ++ ph2
-                                  , fr_suggestions = s1  ++ s2 })
-             _other -> return res2
-    _other -> return res
+-- from MkIface
+putNameLiterally :: B.BinHandle -> Name -> IO ()
+putNameLiterally bh name =
+  do
+    B.put_ bh $! nameModule name
+    B.put_ bh $! nameOccName name

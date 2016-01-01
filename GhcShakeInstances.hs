@@ -25,6 +25,10 @@ instance Show UnitId where
 instance Binary UnitId where
     put = put . unitIdFS
     get = fmap fsToUnitId get
+instance NFData UnitId where
+    rnf s = s `seq` ()
+instance Hashable UnitId where
+    hashWithSalt s a = getKey (getUnique a) + s
 
 -- ModuleName
 instance Show ModuleName where
@@ -34,6 +38,8 @@ instance Binary ModuleName where
     get = fmap mkModuleNameFS get
 instance Hashable ModuleName where
     hashWithSalt s a = getKey (getUnique a) + s
+instance NFData ModuleName where
+    rnf s = s `seq` ()
 
 -- Module
 instance Show Module where
@@ -122,7 +128,7 @@ instance NFData BuildModule
 
 -- RecompKey
 data RecompKey
-    = FlagHash Bool
+    = FlagHash Module
     | ExportHash Module IsBoot
     | ModuleHash Module -- external package deps CANNOT be on boot
     | DeclHash Module IsBoot OccName
@@ -131,3 +137,10 @@ data RecompKey
 instance Hashable RecompKey
 instance Binary RecompKey
 instance NFData RecompKey
+
+-- ModLocation
+deriving instance Generic ModLocation
+deriving instance Eq ModLocation
+instance Hashable ModLocation
+instance Binary ModLocation
+instance NFData ModLocation
