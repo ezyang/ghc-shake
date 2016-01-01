@@ -1,3 +1,4 @@
+{-# OPTIONS_GHC -fno-warn-orphan-instances #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE DeriveGeneric #-}
@@ -97,6 +98,10 @@ instance Show NameSpace where
 instance Binary FastString where
     put = put . fastStringToByteString
     get = fmap mkFastStringByteString get
+instance NFData FastString where
+    rnf s = s `seq` ()
+instance Hashable FastString where
+    hashWithSalt s fs = getKey (getUnique fs) + s
 
 -- Fingerprint
 instance Hashable Fingerprint where
@@ -116,25 +121,33 @@ instance NFData Phase
 instance Binary Phase
 instance Hashable Phase
 
--- BuildModule
-type IsBoot = Bool
-data BuildModule -- this is what it's called in GhcMake
+-- | A 'BuildModule' is a key for module which can be built.  Unlike
+-- in 'GhcMake', we also store the source filename (because a module
+-- may be implemented multiple times by different source files.)
+data BuildModule
     = BuildModule {
         bm_filename :: FilePath,
         bm_mod :: Module,
         bm_is_boot :: IsBoot
         }
     deriving (Show, Typeable, Eq, Generic)
+type IsBoot = Bool
 
 instance Hashable BuildModule
 instance Binary BuildModule
 instance NFData BuildModule
 
--- RecompKey
+-- | A 'RecompKey' is a key for a hash, for which recompilation can
+-- be predicated on.  Each hash represents some aspect of a module
+-- which you could depend on.
 data RecompKey
+    -- | The flags which were passed to compile a module.
     = FlagHash Module
+    -- | The export list of a (boot) module
     | ExportHash Module IsBoot
+    -- | The entire interface of the module
     | ModuleHash Module -- external package deps CANNOT be on boot
+    -- | The declaration hash of a specific named entity
     | DeclHash Module IsBoot OccName
     deriving (Show, Typeable, Eq, Generic)
 

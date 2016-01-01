@@ -20,6 +20,7 @@ library
   other-modules:       GhcShakeInstances
                        Compat
                        GhcAction
+                       PersistentCache
   -- other-extensions:    
   build-depends:       base,
                        ghc == 7.11.*,
@@ -32,3 +33,4 @@ library
                        filepath
   -- hs-source-dirs:      
   default-language:    Haskell2010
+  ghc-options:         -Wall

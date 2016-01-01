@@ -1,74 +1,54 @@
 {-# LANGUAGE NondecreasingIndentation #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
+
+{-|
+Module      : GhcAction
+Description : Reimplemented GHC functionality in the Action monad
+Copyright   : (c) Edward Z. Yang, 2015-2016
+License     : BSD3
+Maintainer  : ezyang@cs.stanford.edu
+Stability   : experimental
+Portability : portable
+
+A lot of behavior (e.g., how an @.o@ file is to be made) depends
+on our ability to actually find the relevant Haskell source file.
+In GHC, the 'Finder' is responsible for implementing this logic
+in the 'IO' monad.
+
+However, finder actions are relevant for recompilation in the
+build system.  Thus, we reimplement them here in the 'Action'
+monad so that we can track them, and trigger a rebuild when the
+result of a finder would have changed.
+
+Shake caches the results of these, so we have to use a simplified
+'FindResult' type which is 'Maybe (ModLocation, Module)'.
+-}
 module GhcAction where
 
 import GhcPlugins hiding ( varName )
-import GHC ( Ghc, setSessionDynFlags, getSession, ImportDecl(..), printException, GhcMonad(..) )
-import DriverPipeline ( compileFile, preprocess, writeInterfaceOnlyMode, compileOne', compileOne, exeFileName, linkBinary )
-import DriverPhases ( Phase(..), isHaskellUserSrcFilename, isHaskellSigFilename
-                    , phaseInputExt, eqPhase, isHaskellSrcFilename )
-import PipelineMonad ( PipelineOutput(..) )
-import SysTools ( newTempName )
-import StringBuffer ( hGetStringBuffer )
-import HeaderInfo ( getImports )
-import PrelNames ( gHC_PRIM, mAIN )
-import Finder ( addHomeModuleToFinder, mkHomeModLocation )
-import ErrUtils ( printBagOfErrors )
-import Platform ( platformBinariesAreStaticLibs )
-import LoadIface ( loadSysInterface )
-import TcRnMonad ( initIfaceCheck )
+import PrelNames ( gHC_PRIM )
+import Finder ( mkHomeModLocation )
 import Packages ( lookupModuleWithSuggestions )
-import FlagChecker ( fingerprintDynFlags )
 
-import Fingerprint
-import HscTypes
-import InstEnv
-import FamInstEnv
-import Maybes
-import NameEnv
-import Panic
-import Unique
-import OccName
-import Module
-
-import GhcShakeInstances
+import GhcShakeInstances ()
 import Compat
+import PersistentCache
 
 import Development.Shake
-import Development.Shake.Rule
 import Development.Shake.Classes
 
-import GHC.Generics (Generic)
-import System.Posix.Signals
+import Prelude hiding (mod)
 import qualified Data.Map as Map
 import Data.Map (Map)
-import Data.Typeable
-import Data.List
-import Data.Maybe
-import Data.IORef
-import Control.Monad
-import Control.Concurrent.MVar
-import Control.Exception
-import System.Environment
 import System.FilePath
-import System.Exit
-import qualified System.Directory as IO
 
------------------------------------------------------------------------
-
--- THE REIMPLEMENTED
-
------------------------------------------------------------------------
-
--- A lot of behavior (e.g. how a .o file is to be made) depends on
--- our ability to actually find the relevant Haskell source file.
--- In GHC, the "Finder" is responsible for implementing this logic.
---
--- However, finder actions are *build-system* relevant.  So we have
--- to reimplement them here so that they are properly tracked.
-
-findImportedModule :: DynFlags -> ModuleName -> Maybe FastString
+-- | Reimplementation of GHC's @findImportedModule@: given a module name
+-- and possibly a package qualifying string (as in an @import "pkg"
+-- ModName@ statement), find the 'ModLocation' and 'Module' that GHC
+-- would consider this import pointing to.
+findImportedModule :: ModuleName -> Maybe FastString
                     -> Action (Maybe (ModLocation, Module))
-findImportedModule dflags mod_name mb_pkg =
+findImportedModule mod_name mb_pkg =
   case mb_pkg of
         Nothing                        -> unqual_import
         Just pkg | pkg == fsLit "this" -> home_import -- "this" is special
@@ -76,31 +56,58 @@ findImportedModule dflags mod_name mb_pkg =
   where
     home_import   = findHomeModule mod_name
 
-    pkg_import    = findExposedPackageModule dflags mod_name mb_pkg
+    pkg_import    = findExposedPackageModule (mod_name, mb_pkg)
 
     unqual_import = findHomeModule mod_name
                     `orIfNotFound`
-                    findExposedPackageModule dflags mod_name Nothing
+                    findExposedPackageModule (mod_name, Nothing)
 
+-- | Reimplementation of GHC's @findExactModule@: given a fully
+-- qualified 'Module', find the 'ModLocation' and 'Module' that GHC
+-- would consider this import pointing to.
 findExactModule :: DynFlags -> Module -> Action (Maybe (ModLocation, Module))
 findExactModule dflags mod =
     if moduleUnitId mod == thisPackage dflags
        then findHomeModule (moduleName mod)
        else findPackageModule mod
 
-findExposedPackageModule :: DynFlags -> ModuleName -> Maybe FastString
-                         -> Action (Maybe (ModLocation, Module))
-findExposedPackageModule dflags mod_name mb_pkg =
-    -- oracle interface makes it annoying to pass
-    -- in auxiliary information
+-- | THIS IS AN ORACLE.  A simplification of GHC's
+-- @lookupModuleWithSuggestions@, which is oracle'ized so we don't have
+-- to have an in-depth understanding of how GHC's package database is
+-- setup.  (Oracle overhead will scale linearly with the number of
+-- imports, but these queries should all be quick lookups into the
+-- package database state.)
+lookupModule :: (ModuleName, Maybe FastString) -> Action (Maybe Module)
+lookupModule = askOracle
+
+-- | The backing implementation of 'lookupModule', to be passed to
+-- 'addOracle'.
+lookupModule' :: DynFlags -> (ModuleName, Maybe FastString) -> Action (Maybe Module)
+lookupModule' dflags (mod_name, mb_pkg) =
     case lookupModuleWithSuggestions dflags mod_name mb_pkg of
-        LookupFound m _  -> findPackageModule m
-        _                -> return Nothing
+        LookupFound m _ -> return (Just m)
+        _ -> return Nothing
 
+-- | Reimplementation of GHC's @findExposedPackageModule@: given a
+-- user import which is known not to be a home module, find it from
+-- the package database.
+findExposedPackageModule :: (ModuleName, Maybe FastString)
+                         -> Action (Maybe (ModLocation, Module))
+findExposedPackageModule (mod_name, mb_pkg) = do
+    mb_m <- lookupModule (mod_name, mb_pkg)
+    case mb_m of
+        Nothing -> return Nothing
+        Just m -> findPackageModule m
+
+-- | THIS IS A PERSISTENT CACHE.  Reimplementation of GHC's
+-- @findPackageModule@: given a fully qualified 'Module', find the
+-- location of its interface files.  (This also returns the 'Module' for
+-- consistency; it's expected to be equal to the input.)
 findPackageModule :: Module -> Action (Maybe (ModLocation, Module))
-findPackageModule = askOracle
+findPackageModule = askPersistentCache
 
--- I'M AN ORACLE
+-- | The backing implementation of 'findPackageModule', to be passed to
+-- 'addPersistentCache'.
 findPackageModule' :: DynFlags -> (Module -> Action (Maybe (ModLocation, Module)))
 findPackageModule' dflags mod = do
   let
@@ -110,6 +117,12 @@ findPackageModule' dflags mod = do
      Nothing -> return Nothing
      Just pkg_conf -> findPackageModule_ dflags mod pkg_conf
 
+-- | Reimplementation of GHC's @findPackageModule_@, a helper function
+-- which also has the 'PackageConfig' for the module.
+--
+-- TODO: PackageConfig should be oracle'ized, so that if a packagedb
+-- entry changes we recompile correctly, or the package database
+-- treated more correctly.
 findPackageModule_ :: DynFlags -> Module -> PackageConfig -> Action (Maybe (ModLocation, Module))
 findPackageModule_ dflags mod pkg_conf =
 
@@ -141,16 +154,19 @@ findPackageModule_ dflags mod pkg_conf =
     _otherwise ->
           searchPathExts import_dirs mod [(package_hisuf, mk_hi_loc)]
 
+-- | THIS IS A PERSISTENT CACHE.  A reimplementation of GHC's
+-- @findHomeModule@: given a 'ModuleName' find the location of the home
+-- module that implements it.
 findHomeModule :: ModuleName -> Action (Maybe (ModLocation, Module))
-findHomeModule = askOracle
+findHomeModule = askPersistentCache
 
--- I'M AN ORACLE
-findHomeModule' :: DynFlags -> (ModuleNameEnv FilePath)
+-- | The backing implementation of 'findHomeModule', to be passed to
+-- 'addPersistentCache'.
+findHomeModule' :: DynFlags
                 -> (ModuleName -> Action (Maybe (ModLocation, Module)))
-findHomeModule' dflags mod_name_to_file mod_name =
+findHomeModule' dflags mod_name =
    let
      home_path = importPaths dflags
-     hisuf = hiSuf dflags
      mod = mkModule (thisPackage dflags) mod_name
 
      exts =
@@ -163,21 +179,59 @@ findHomeModule' dflags mod_name_to_file mod_name =
    in
   if mod == gHC_PRIM
     then return (Just (ModLocation Nothing "fake.GHC.Prim" "fake.GHC.Prim", mod))
-    else case lookupUFM mod_name_to_file mod_name of
-            Just file -> do
-                loc <- liftIO $ mkHomeModLocation dflags mod_name file
-                return (Just (loc, (mkModule (thisPackage dflags) mod_name)))
-            _ -> searchPathExts home_path mod exts
+    else
+        do mb_file <- askModuleNameFile mod_name
+           case mb_file of
+                Just file -> do
+                    loc <- liftIO $ mkHomeModLocation dflags mod_name file
+                    return (Just (loc, mod))
+                _ -> searchPathExts home_path mod exts
+
+-- | Newtype for 'askFileModuleName' question type.
+newtype FileModuleName = FileModuleName FilePath
+    deriving (Show, Typeable, Eq, Hashable, Binary, NFData)
+
+-- | THIS IS AN ORACLE.  Given a file, this says what the module name
+-- name of it is.  It's an oracle because this mapping depends on what
+-- command line arguments are passed to GHC.
+askFileModuleName :: FilePath -> Action ModuleName
+askFileModuleName = askOracle . FileModuleName
+
+-- | The backing implementation of 'askFileModuleName', to be passed
+-- to 'addOracle'.
+askFileModuleName' :: Map FilePath ModuleName -> FileModuleName -> Action ModuleName
+askFileModuleName' file_to_mod_name (FileModuleName file) =
+    case Map.lookup file file_to_mod_name of
+        Nothing -> error "illegal file"
+        Just mod_name -> return mod_name
+
+-- | Newtype for 'askModuleNameFile' question type.
+newtype ModuleNameFile = ModuleNameFile ModuleName
+    deriving (Show, Typeable, Eq, Hashable, Binary, NFData)
+
+-- | THIS IS AN ORACLE.  Given a module name, is there a file which
+-- implements it which was EXPLICITLY requested in the command line.
+-- It's an oracle because this mapping depends on what command line
+-- arguments are passed to GHC.
+askModuleNameFile :: ModuleName -> Action (Maybe FilePath)
+askModuleNameFile = askOracle . ModuleNameFile
+
+-- | The backing implementation of 'askModuleNameFile', to be passed
+-- to 'addOracle'
+askModuleNameFile' :: ModuleNameEnv FilePath -> ModuleNameFile -> Action (Maybe FilePath)
+askModuleNameFile' mod_name_to_file (ModuleNameFile mod_name) = return (lookupUFM mod_name_to_file mod_name)
 
 type FileExt = String
 type BaseName = String
 
+-- | Pure reimplementation of GHC's @mkHomeModLocationSearched@.
 mkHomeModLocationSearched :: DynFlags -> ModuleName -> FileExt
                           -> FilePath -> BaseName -> ModLocation
 mkHomeModLocationSearched dflags mod suff path basename =
    mkHomeModLocation2 dflags mod (if path == "." then basename
                                                  else path </> basename) suff
 
+-- | Pure reimplementation of GHC's @mkHomeModLocation2@.
 mkHomeModLocation2 :: DynFlags
                    -> ModuleName
                    -> FilePath  -- Of source module, without suffix
@@ -193,6 +247,7 @@ mkHomeModLocation2 dflags mod src_basename ext =
                     ml_hi_file   = hi_fn,
                     ml_obj_file  = obj_fn })
 
+-- | Pure reimplementation of GHC's @mkHiOnlyModLocation@.
 mkHiOnlyModLocation :: DynFlags -> Suffix -> FilePath -> String
                     -> ModLocation
 mkHiOnlyModLocation dflags hisuf path basename
@@ -207,6 +262,8 @@ mkHiOnlyModLocation dflags hisuf path basename
                              ml_obj_file  = obj_fn
                     }
 
+-- | Reimplementation of GHC's @searchPathExts@, but tracking where
+-- was probed.
 searchPathExts
   :: [FilePath]         -- paths to search
   -> Module             -- module name
@@ -241,19 +298,7 @@ searchPathExts paths mod exts
         then return (Just (loc, mod))
         else search rest
 
--- | If there is no -o option, guess the name of target executable
--- by using top-level source file name as a base.
---
--- Original was in the Ghc monad but we don't want that
-guessOutputFile :: FilePath -> FilePath
-guessOutputFile mainModuleSrcPath =
-    let name = dropExtension mainModuleSrcPath
-    in if name == mainModuleSrcPath
-        then throwGhcException . UsageError $
-                 "default output name would overwrite the input file; " ++
-                 "must specify -o explicitly"
-        else name
-
+-- | Reimplementation of GHC's @orIfNotFound@, but on a simplified type.
 orIfNotFound :: Monad m => m (Maybe a) -> m (Maybe a) -> m (Maybe a)
 orIfNotFound this or_this = do
   res <- this

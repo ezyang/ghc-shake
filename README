@@ -54,11 +54,20 @@ projects you want to build as well as ghc-shake.  Then you can say:
     3. Some odd edge-cases for output files in --make (especially
     for file targets).
 
-    4. Recompilation avoidance is still not perfect. Obvious
-    places we can improve:
-
-        - Track flags and package databases
-
-        - Reimplement GHC's recomp avoidance
-
 If you need something, shout and I'll try to implement it.
+
+# Known recompilation bugs
+
+We reimplement GHC's recompilation avoidance: if GHC would
+have reported, "compilation is NOT necessary", our goal is
+to just skip the module entirely.
+
+There are some bits we haven't gotten around to implementing
+yet:
+
+    - If you change the package database flags / modify
+      the package database, we may fail to pick up the
+      changes which cause different interface files to
+      be loaded.  (However, we WILL pick up changes to
+      the interface files themselves, so long as they
+      are in the same place.)

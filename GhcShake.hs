@@ -8,39 +8,28 @@
 module GhcShake where
 
 import GhcPlugins hiding ( varName, errorMsg, fatalErrorMsg )
-import GHC ( Ghc, setSessionDynFlags, getSession, ImportDecl(..), printException, GhcMonad(..), guessTarget )
-import DriverPipeline ( compileFile, preprocess, writeInterfaceOnlyMode, compileOne', compileOne, exeFileName, linkBinary )
-import DriverPhases ( Phase(..), isHaskellUserSrcFilename, isHaskellSigFilename
-                    , phaseInputExt, eqPhase, isHaskellSrcFilename )
+import GHC ( Ghc, setSessionDynFlags, getSession, GhcMonad(..), guessTarget )
+import DriverPipeline ( compileFile, preprocess, compileOne', exeFileName, linkBinary )
+import DriverPhases ( Phase(..), isHaskellSigFilename )
 import PipelineMonad ( PipelineOutput(..) )
-import SysTools ( newTempName )
 import StringBuffer ( hGetStringBuffer )
 import HeaderInfo ( getImports )
-import PrelNames ( gHC_PRIM, mAIN )
 import Finder ( addHomeModuleToFinder, mkHomeModLocation )
-import ErrUtils ( printBagOfErrors )
 import Platform ( platformBinariesAreStaticLibs )
 import LoadIface ( loadSysInterface, loadUserInterface )
 import TcRnMonad ( initIfaceCheck )
-import Packages ( lookupModuleWithSuggestions )
 import FlagChecker ( fingerprintDynFlags )
 import TcRnTypes ( mkModDeps )
 
 import Fingerprint
 import ErrUtils
-import HscTypes
-import InstEnv
-import FamInstEnv
 import Maybes
-import NameEnv
 import Panic
-import Unique
-import OccName
-import Module
 
 import GhcShakeInstances
 import GhcAction
 import Compat
+import PersistentCache
 
 import Development.Shake
 import Development.Shake.Rule
@@ -52,27 +41,20 @@ import Development.Shake.ByteString
 import Development.Shake.Core
 import General.String
 
+import Prelude hiding (mod)
 import GHC.Generics (Generic)
 import System.Posix.Signals
 import qualified Data.Map as Map
 import qualified Data.HashMap.Strict as HashMap
 import Data.Dynamic
-import Data.Bits
 import Data.Map (Map)
-import Data.Typeable
 import Data.List
-import Data.Maybe
-import Data.IORef
 import Data.Tuple
-import Data.Either
 import Control.Monad
-import Control.Concurrent.MVar
 import Control.Exception
 import System.Environment
 import System.FilePath
 import System.Exit
-import qualified System.Directory as IO
-import qualified Data.IntSet as IntSet
 
 frontendPlugin :: FrontendPlugin
 frontendPlugin = defaultFrontendPlugin {
@@ -83,7 +65,7 @@ doShake :: [String] -> [(String, Maybe Phase)] -> Ghc ()
 doShake args srcs = do
     -- Fix up DynFlags to correct form
     dflags0 <- fmap normaliseDynFlags getDynFlags
-    setSessionDynFlags
+    _ <- setSessionDynFlags
         -- HACK: ghc --make -fno-code is not supposed to generate any
         -- interface files, but this is hard to implement in Shake so I
         -- am forcing -fwrite-interface in such cases.
@@ -133,10 +115,10 @@ doShake args srcs = do
     -- Restore normal signal handlers, since we're not GHCi!
     -- If we don't do this, ^C will not kill us correctly.
     -- TODO: don't try to do this on Windows
-    installHandler sigINT Default Nothing
-    installHandler sigHUP Default Nothing
-    installHandler sigTERM Default Nothing
-    installHandler sigQUIT Default Nothing
+    _ <- installHandler sigINT Default Nothing
+    _ <- installHandler sigHUP Default Nothing
+    _ <- installHandler sigTERM Default Nothing
+    _ <- installHandler sigQUIT Default Nothing
 
     -- Unwrap Shake exceptions so GHC's error handler handles it
     -- properly
@@ -179,15 +161,21 @@ doShake args srcs = do
             case Map.lookup input_fn input_map of
                 Nothing -> error "askNonHsObjectPhase"
                 Just r -> return r
-    addOracle (findHomeModule' dflags mod_name_to_file) -- findHomeModule
-    addOracle (findPackageModule' dflags)               -- findPackageModule
-    addOracle (askRecompKey' hsc_env) -- askRecompKey
+    -- Un-hyphenated identifiers are how to invoke
+    _ <- addOracle (askFileModuleName' file_to_mod_name)
+    _ <- addOracle (askModuleNameFile' mod_name_to_file)
+    _ <- addOracle (lookupModule' dflags)
+    -- These are cached because GHC caches them
+    _ <- addPersistentCache (findHomeModule' dflags)
+    _ <- addPersistentCache (findPackageModule' dflags)
+    -- This is cached because we want unchanging builds to apply to this
+    _ <- addPersistentCache (askRecompKey' hsc_env)
 
     -- Non-hs files
     want non_hs_o_files
-    forM non_hs_o_files $
+    forM_ non_hs_o_files $
         \output_fn -> do
-            output_fn %> \output_fn -> do
+            output_fn %> \_ -> do
                 (input_fn, mb_phase) <- askNonHsObjectPhase output_fn
                 need [input_fn]
                 output_fn2 <- liftIO $
@@ -202,14 +190,7 @@ doShake args srcs = do
         Target{ targetId = TargetModule mod_name } ->
             needHomeModule mod_name >> return ()
         Target{ targetId = TargetFile file _ } ->
-            case Map.lookup file file_to_mod_name of
-                Nothing -> error "should not happen"
-                Just mod_name -> do
-                    let is_boot = "-boot" `isSuffixOf` file
-                    apply1 (BuildModule file (mkModule (thisPackage dflags) mod_name) is_boot)
-                        :: Action BuildModuleA
-                    return ()
-
+            needFileTarget dflags file_to_mod_name file >> return ()
 
     -- Linking is computed separately
     let a_root_isMain = any is_main_target targets
@@ -246,18 +227,18 @@ doShake args srcs = do
                       . mi_deps $ main_iface
         home_finds <- mapM needHomeModule home_deps
         let obj_files = map (ml_obj_file . fst) $ catMaybes home_finds
-        need non_hs_o_files
+        need =<< askNonHsObjectFiles
 
         -- duplicated from linkBinary' in DriverPipeline
         -- depend on libraries in the library paths for relink
         let pkg_deps = map fst . dep_pkgs . mi_deps $ main_iface
         pkg_lib_paths <- liftIO $ getPackageLibraryPath dflags pkg_deps
-        getDirectoryFiles "." (map (</> "*") pkg_lib_paths)
+        _ <- getDirectoryFiles "." (map (</> "*") pkg_lib_paths)
 
         -- Reimplements link' in DriverPipeline
         let link = case ghcLink dflags of
                 LinkBinary    -> linkBinary
-                other         -> error ("don't know how to link this way " ++ show (ghcLink dflags))
+                _             -> error ("don't know how to link this way " ++ show (ghcLink dflags))
 
         putNormal ("Linking " ++ out ++ " ...")
         quietly . traced "linking" $
@@ -278,12 +259,13 @@ doShake args srcs = do
 
         let non_boot_location = buildModuleLocation dflags bm { bm_is_boot = False }
             location = buildModuleLocation dflags bm
-        mod <- liftIO $ addHomeModuleToFinder hsc_env mod_name non_boot_location
+        mod' <- liftIO $ addHomeModuleToFinder hsc_env mod_name non_boot_location
+        assert (mod == mod') $ return ()
 
         -- Force the direct dependencies to be compiled.
         unsafeIgnoreDependencies $ do
-            mapM_ (needImportedModule dflags False) the_imps
-            mapM_ (needImportedModule dflags True) srcimps
+            mapM_ (needImportedModule False) the_imps
+            mapM_ (needImportedModule True) srcimps
 
         -- Construct the ModSummary
         src_timestamp <- liftIO $ getModificationUTCTime file
@@ -337,6 +319,9 @@ newtype NonHsObjectFiles = NonHsObjectFiles ()
     deriving (Show, Typeable, Eq, Hashable, Binary, NFData)
 
 newtype NonHsObjectPhase = NonHsObjectPhase String
+    deriving (Show, Typeable, Eq, Hashable, Binary, NFData)
+
+newtype FileModuleName = FileModuleName FilePath
     deriving (Show, Typeable, Eq, Hashable, Binary, NFData)
 
 -----------------------------------------------------------------------
@@ -450,7 +435,7 @@ explicitFileMapping hsc_env targets = do
 getNonHsObjectFiles :: DynFlags -> [(FilePath, Maybe Phase)]
                     -> IO [FilePath]
 getNonHsObjectFiles dflags non_hs_srcs =
-    forM non_hs_srcs $ \(input_fn, mb_phase) -> do
+    forM non_hs_srcs $ \(input_fn, _) -> do
         -- This code was based off of @compileFile hsc_env StopLn x@
         let -- Technically -fno-code should cause a temporary file to
             -- be made, but making this deterministic is better
@@ -500,8 +485,6 @@ buildModuleLocation dflags (BuildModule file mod is_boot) =
 buildModuleLocations :: DynFlags -> BuildModule -> (ModLocation, ModLocation)
 buildModuleLocations dflags bm =
     let dyn_dflags = dynamicTooMkDynamicDynFlags dflags
-        loc        = buildModuleLocation dflags bm
-        dyn_loc    = buildModuleLocation dyn_dflags bm
     in (buildModuleLocation dflags bm, buildModuleLocation dyn_dflags bm)
 
 -- The goods
@@ -540,6 +523,7 @@ shakeDynFlags opts =
                     Just dflags -> dflags
                     Nothing -> error "bad type"
 
+mkFileQ :: FilePath -> FileQ
 mkFileQ = FileQ . packU_ . filepathNormalise . unpackU_ . packU
 
 -- This is similar to the Files rule, representing four files.  However,
@@ -571,24 +555,36 @@ instance Rule BuildModule BuildModuleA where
                             Nothing -> NotEqual
                             Just r -> r
             -- Copy-pasted from Shake
-            and_ NotEqual x = NotEqual
+            and_ NotEqual _ = NotEqual
             and_ EqualCheap x = x
             and_ EqualExpensive x = if x == NotEqual then NotEqual else EqualExpensive
 
 needModule :: DynFlags -> Module -> IsBoot
            -> Action (Maybe (ModLocation, Module))
-needModule dflags mod is_boot = do
+needModule dflags mod is_boot =
     needFindResult is_boot =<< findExactModule dflags mod
 
 needHomeModule :: ModuleName
                -> Action (Maybe (ModLocation, Module))
-needHomeModule mod_name = do
+needHomeModule mod_name =
     needFindResult False =<< findHomeModule mod_name
 
-needImportedModule :: DynFlags -> IsBoot -> (Maybe FastString, Located ModuleName)
+needFileTarget :: DynFlags -> Map FilePath ModuleName -> FilePath
+               -> Action (Maybe (ModLocation, Module))
+needFileTarget dflags file_to_mod_name file =
+    case Map.lookup file file_to_mod_name of
+        Nothing -> return Nothing
+        Just mod_name -> do
+            let is_boot = "-boot" `isSuffixOf` file
+                mod = mkModule (thisPackage dflags) mod_name
+                bm = BuildModule file mod is_boot
+            _ <- apply1 bm :: Action BuildModuleA
+            return (Just (buildModuleLocation dflags bm, mod))
+
+needImportedModule :: IsBoot -> (Maybe FastString, Located ModuleName)
                    -> Action (Maybe (ModLocation, Module))
-needImportedModule dflags is_boot (mb_pkg, L _ mod_name) = do
-    needFindResult is_boot =<< findImportedModule dflags mod_name mb_pkg
+needImportedModule is_boot (mb_pkg, L _ mod_name) = do
+    needFindResult is_boot =<< findImportedModule mod_name mb_pkg
 
 needMainModule :: DynFlags -> Action (Maybe (ModLocation, Module))
 needMainModule dflags =
@@ -614,7 +610,6 @@ needFindResult is_boot r = do
 needInterfaceUsages :: DynFlags -> ModIface -> Action ()
 needInterfaceUsages dflags iface = do
     let -- Need this to check if it's boot or not
-        mod = mi_module iface
         mod_deps = mkModDeps (dep_mods (mi_deps iface))
         usageKey UsagePackageModule{ usg_mod = mod }
             = [ ModuleHash mod ]
@@ -633,12 +628,12 @@ needInterfaceUsages dflags iface = do
         usageFile _ = []
 
     -- We could parallelize this but it's kind of pointless
-    askRecompKey (FlagHash mod)
-    mapM askRecompKey (concatMap usageKey (mi_usages iface))
+    _ <- askRecompKey (FlagHash (mi_module iface))
+    mapM_ askRecompKey (concatMap usageKey (mi_usages iface))
     need (concatMap usageFile (mi_usages iface))
 
 askRecompKey :: RecompKey -> Action Fingerprint
-askRecompKey = askOracle
+askRecompKey = askPersistentCache
 
 -- To make Shake's dependency tracking as accurate as possible, we
 -- reimplement GHC's recompilation avoidance.  The idea:
@@ -662,7 +657,7 @@ askRecompKey' :: HscEnv -> RecompKey -> Action Fingerprint
 askRecompKey' hsc_env k = do
     let dflags = hsc_dflags hsc_env
         get_iface mod is_boot = do
-            needModule dflags mod is_boot
+            _ <- needModule dflags mod is_boot
             liftIO . initIfaceCheck hsc_env
                    -- not really a user interface load, but it's the
                    -- easiest way to specify boot-edness
@@ -679,3 +674,17 @@ askRecompKey' hsc_env k = do
             return $ case mi_hash_fn iface occ of
                         Nothing -> error "could not find fingerprint"
                         Just (_, fp) -> fp
+
+
+-- | If there is no -o option, guess the name of target executable
+-- by using top-level source file name as a base.
+--
+-- Original was in the Ghc monad but we don't want that
+guessOutputFile :: FilePath -> FilePath
+guessOutputFile mainModuleSrcPath =
+    let name = dropExtension mainModuleSrcPath
+    in if name == mainModuleSrcPath
+        then throwGhcException . UsageError $
+                 "default output name would overwrite the input file; " ++
+                 "must specify -o explicitly"
+        else name
