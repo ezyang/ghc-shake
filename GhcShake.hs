@@ -74,22 +74,10 @@ import System.Exit
 import qualified System.Directory as IO
 import qualified Data.IntSet as IntSet
 
-newtype NonHsObjectFiles = NonHsObjectFiles ()
-    deriving (Show, Typeable, Eq, Hashable, Binary, NFData)
-
-newtype NonHsObjectPhase = NonHsObjectPhase String
-    deriving (Show, Typeable, Eq, Hashable, Binary, NFData)
-
 frontendPlugin :: FrontendPlugin
 frontendPlugin = defaultFrontendPlugin {
         frontend = doShake
     }
-
------------------------------------------------------------------------
-
--- THE MAIN STUFF
-
------------------------------------------------------------------------
 
 doShake :: [String] -> [(String, Maybe Phase)] -> Ghc ()
 doShake args srcs = do
@@ -212,7 +200,7 @@ doShake args srcs = do
     -- Want to build every target a user specified on the command line.
     action $ forP targets $ \target -> case target of
         Target{ targetId = TargetModule mod_name } ->
-            needHomeModule mod_name
+            needHomeModule mod_name >> return ()
         Target{ targetId = TargetFile file _ } ->
             case Map.lookup file file_to_mod_name of
                 Nothing -> error "should not happen"
@@ -247,44 +235,34 @@ doShake args srcs = do
 
     -- How to link the top-level thing
     exeFileName staticLink linker_dflags %> \out -> do
-        -- TODO: this strategy doesn't work for Opt_NoHsMain
-        when (gopt Opt_NoHsMain dflags) $ error "-no-hs-main not supported"
+        Just main_find <- needMainModule dflags
 
-        let mainFile = fromJust mb_mainFile
-            -- TODO: hack to get linking with dynamic semi-working.
-            -- TOdO: use maybeMkDynamicDynFlags
-            mkMaybeDynObjPath dflags
-                = mkObjPath (maybeMkDynamicDynFlags (gopt Opt_BuildDynamicToo dflags) dflags)
-        -- Need both: the object file for linking, the hi file
-        -- to figure out what to link
-        need [ mkHiPath  dflags (dropExtension mainFile) "Main",
-               mkMaybeDynObjPath dflags (dropExtension mainFile) "Main" ]
         -- Compute the transitive home modules
         main_iface <- liftIO . initIfaceCheck hsc_env
-                    $ loadSysInterface (text "linking main") mAIN
-        let mod_name_deps = map fst . filter (not.snd)
-                          . dep_mods . mi_deps $ main_iface
-        dep_loc_mods <- getDepLocs mod_name_deps
-        -- assert dep_loc_mods is all home modules
-        let obj_files = map (ml_obj_file . fst) dep_loc_mods
-                     ++ non_hs_o_files -- extra objects
-        need obj_files
+                    $ loadSysInterface (text "linking main") (mainModIs dflags)
+        let home_deps = map fst -- get the ModuleName
+                      . filter (not . snd) -- filter out boot
+                      . dep_mods
+                      . mi_deps $ main_iface
+        home_finds <- mapM needHomeModule home_deps
+        let obj_files = map (ml_obj_file . fst) $ catMaybes home_finds
+        need non_hs_o_files
+
+        -- duplicated from linkBinary' in DriverPipeline
+        -- depend on libraries in the library paths for relink
         let pkg_deps = map fst . dep_pkgs . mi_deps $ main_iface
-        -- TODO: this is slightly buggy; if a module is mentioned
-        -- on the command line, it should be linked in.
+        pkg_lib_paths <- liftIO $ getPackageLibraryPath dflags pkg_deps
+        getDirectoryFiles "." (map (</> "*") pkg_lib_paths)
+
         -- Reimplements link' in DriverPipeline
         let link = case ghcLink dflags of
                 LinkBinary    -> linkBinary
                 other         -> error ("don't know how to link this way " ++ show (ghcLink dflags))
-        -- duplicated from linkBinary' in DriverPipeline
-        pkg_lib_paths <- liftIO $ getPackageLibraryPath dflags pkg_deps
-        -- depend on libraries in the library paths for relink
-        getDirectoryFiles "." (map (</> "*") pkg_lib_paths)
+
         putNormal ("Linking " ++ out ++ " ...")
         quietly . traced "linking" $
             link linker_dflags
-                ((mkMaybeDynObjPath dflags (dropExtension mainFile) "Main")
-                    : obj_files) pkg_deps
+                (ml_obj_file (fst main_find) : obj_files) pkg_deps
         return ()
 
     rule $ \bm@(BuildModule file mod is_boot) -> Just $ do
@@ -298,6 +276,10 @@ doShake args srcs = do
         buf <- liftIO $ hGetStringBuffer hspp_fn
         (srcimps, the_imps, L _ mod_name) <- liftIO $ getImports dflags' buf hspp_fn file
 
+        let non_boot_location = buildModuleLocation dflags bm { bm_is_boot = False }
+            location = buildModuleLocation dflags bm
+        mod <- liftIO $ addHomeModuleToFinder hsc_env mod_name non_boot_location
+
         -- Force the direct dependencies to be compiled.
         unsafeIgnoreDependencies $ do
             mapM_ (needImportedModule dflags False) the_imps
@@ -305,9 +287,7 @@ doShake args srcs = do
 
         -- Construct the ModSummary
         src_timestamp <- liftIO $ getModificationUTCTime file
-        let mod = mkModule (thisPackage dflags) mod_name
-            location = buildModuleLocation dflags bm
-            hsc_src = if isHaskellSigFilename file
+        let hsc_src = if isHaskellSigFilename file
                         then HsigFile
                         else if is_boot
                                 then HsBootFile
@@ -353,9 +333,11 @@ doShake args srcs = do
 
     return ()
 
-maybeMkDynamicDynFlags is_dyn
-    | is_dyn = dynamicTooMkDynamicDynFlags
-    | otherwise = id
+newtype NonHsObjectFiles = NonHsObjectFiles ()
+    deriving (Show, Typeable, Eq, Hashable, Binary, NFData)
+
+newtype NonHsObjectPhase = NonHsObjectPhase String
+    deriving (Show, Typeable, Eq, Hashable, Binary, NFData)
 
 -----------------------------------------------------------------------
 
@@ -593,31 +575,40 @@ instance Rule BuildModule BuildModuleA where
             and_ EqualCheap x = x
             and_ EqualExpensive x = if x == NotEqual then NotEqual else EqualExpensive
 
-needModule :: DynFlags -> Module -> IsBoot -> Action ()
+needModule :: DynFlags -> Module -> IsBoot
+           -> Action (Maybe (ModLocation, Module))
 needModule dflags mod is_boot = do
     needFindResult is_boot =<< findExactModule dflags mod
 
-needHomeModule :: ModuleName -> Action ()
+needHomeModule :: ModuleName
+               -> Action (Maybe (ModLocation, Module))
 needHomeModule mod_name = do
     needFindResult False =<< findHomeModule mod_name
 
-needImportedModule :: DynFlags -> IsBoot -> (Maybe FastString, Located ModuleName) -> Action ()
+needImportedModule :: DynFlags -> IsBoot -> (Maybe FastString, Located ModuleName)
+                   -> Action (Maybe (ModLocation, Module))
 needImportedModule dflags is_boot (mb_pkg, L _ mod_name) = do
     needFindResult is_boot =<< findImportedModule dflags mod_name mb_pkg
 
-needFindResult :: IsBoot -> Maybe (ModLocation, Module) -> Action ()
-needFindResult is_boot r =
+needMainModule :: DynFlags -> Action (Maybe (ModLocation, Module))
+needMainModule dflags =
+    needHomeModule (moduleName (mainModIs dflags))
+
+needFindResult :: IsBoot -> Maybe (ModLocation, Module) -> Action (Maybe (ModLocation, Module))
+needFindResult is_boot r = do
     let maybeAddBootSuffix
             | is_boot   = addBootSuffix
             | otherwise = id
-    in case r of
+    case r of
         Just (loc, mod) ->
             case ml_hs_file loc of
-                Nothing -> need [ maybeAddBootSuffix (ml_hi_file loc) ]
+                Nothing ->
+                    need [ maybeAddBootSuffix (ml_hi_file loc) ]
                 Just src_file -> do
-                    apply1 (BuildModule src_file mod is_boot) :: Action BuildModuleA
+                    _ <- apply1 (BuildModule src_file mod is_boot) :: Action BuildModuleA
                     return ()
         _ -> return () -- Let GHC error when we actually try to look it up
+    return r
 
 -- Register fine-grained dependencies
 needInterfaceUsages :: DynFlags -> ModIface -> Action ()

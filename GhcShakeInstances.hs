@@ -119,7 +119,11 @@ instance Hashable Phase
 -- BuildModule
 type IsBoot = Bool
 data BuildModule -- this is what it's called in GhcMake
-    = BuildModule FilePath Module IsBoot
+    = BuildModule {
+        bm_filename :: FilePath,
+        bm_mod :: Module,
+        bm_is_boot :: IsBoot
+        }
     deriving (Show, Typeable, Eq, Generic)
 
 instance Hashable BuildModule
