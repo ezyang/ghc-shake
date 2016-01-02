@@ -128,7 +128,7 @@ findPackageModule_ dflags mod pkg_conf =
 
   -- special case for GHC.Prim; we won't find it in the filesystem.
   if mod == gHC_PRIM
-        then return (Just (ModLocation Nothing "fake.GHC.Prim" "fake.GHC.Prim", mod))
+        then return Nothing
         else
 
   let
@@ -178,7 +178,7 @@ findHomeModule' dflags mod_name =
 
    in
   if mod == gHC_PRIM
-    then return (Just (ModLocation Nothing "fake.GHC.Prim" "fake.GHC.Prim", mod))
+    then return Nothing
     else
         do mb_file <- askModuleNameFile mod_name
            case mb_file of

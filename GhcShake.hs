@@ -10,7 +10,7 @@ import DriverPhases ( Phase(..), isHaskellSigFilename )
 import PipelineMonad ( PipelineOutput(..) )
 import StringBuffer ( hGetStringBuffer )
 import HeaderInfo ( getImports )
-import Finder ( addHomeModuleToFinder )
+import Finder ( addHomeModuleToFinder, mkHomeModLocation )
 import Platform ( platformBinariesAreStaticLibs )
 import LoadIface ( loadSysInterface, loadUserInterface )
 import TcRnMonad ( initIfaceCheck )
@@ -141,7 +141,7 @@ doShake args srcs = do
                                 3 -> Loud
                                 4 -> Chatty
                                 _ -> Diagnostic,
-            shakeLint = Just LintBasic, -- for dev
+            -- shakeLint = Just LintBasic, -- for dev
             shakeAssume = if gopt Opt_ForceRecomp dflags
                             then Just AssumeDirty
                             else Nothing,
@@ -232,7 +232,8 @@ doShake args srcs = do
         -- depend on libraries in the library paths for relink
         let pkg_deps = map fst . dep_pkgs . mi_deps $ main_iface
         pkg_lib_paths <- liftIO $ getPackageLibraryPath dflags pkg_deps
-        _ <- getDirectoryFiles "." (map (</> "*") pkg_lib_paths)
+        _libs <- getDirectoryFiles "/" (map (</> "*") pkg_lib_paths)
+        -- TODO: properly check this
 
         -- Reimplements link' in DriverPipeline
         let link = case ghcLink dflags of
@@ -404,15 +405,17 @@ explicitFileMapping hsc_env targets = do
     let get_file_target Target { targetId = TargetFile file _ } = Just file
         get_file_target _ = Nothing
         file_targets = mapMaybe get_file_target targets
+        dflags = hsc_dflags hsc_env
     forM file_targets $ \file -> do
         -- ahh, it's too bad that we have to redo the preprocessor...
         (dflags', hspp_fn) <- preprocess hsc_env (file, Nothing)
         buf <- hGetStringBuffer hspp_fn
         -- TODO do less work parsing!
         (_, _, L _ mod_name) <- getImports dflags' buf hspp_fn file
-        -- location <- mkHomeModLocation dflags mod_name file
         -- Make sure we can find it!
-        -- _ <- addHomeModuleToFinder hsc_env mod_name location
+        -- Why do we need this? Try building Setup.hs
+        location <- mkHomeModLocation dflags mod_name file
+        _ <- addHomeModuleToFinder hsc_env mod_name location
         return (mod_name, file)
 
 
