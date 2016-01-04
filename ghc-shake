@@ -8,6 +8,8 @@ for var in "$@"; do
     else
         ARGS+=("--frontend")
         ARGS+=("GhcShake")
+        ARGS+=("-ffrontend-opt")
+        ARGS+=("--digest-and-input")
         #ARGS+=("-ffrontend-opt")
         #ARGS+=("--profile")
         #ARGS+=("-ffrontend-opt")
