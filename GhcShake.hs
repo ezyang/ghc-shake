@@ -246,6 +246,10 @@ doShake args srcs = do
                 (ml_obj_file (fst main_find) : obj_files) pkg_deps
         return ()
 
+    -- ToDo: rules for %.hi and %.o.  These can be a bit annoying to
+    -- manage, because we have to reverse engineer the correct module
+    -- name.
+
     buildModuleRule $ \bm@(BuildModule raw_file mod is_boot) -> do
 
         -- This is annoying

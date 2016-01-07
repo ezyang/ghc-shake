@@ -13,61 +13,55 @@ compared to --make if you compile with only one core.
     2. You can keep going even when one file fails to compile,
     making sure that anything can be built, is built.
 
-    3. You get all the nice Shake features, e.g. estimated
-    completion time and profiling.  The profiling is really
+    3. You get all the nice Shake features, e.g. unchanging
+    rebuilds and profiling.  The profiling is really
     handy!
 
 # How do I use it?
 
-Currently, I'm testing on a very specific configuration:
+You'll need these two (somewhat hard to get) items:
 
-    - GHC with frontend plugins.  A sufficiently recent
-      GHC HEAD will suffice.
+    - GHC 8.0
 
-    - Cabal with nix-local-build.  Get it here:
-        https://github.com/haskell/cabal/tree/nix-local-build
+    - A customized version of Shake: https://github.com/ezyang/shake
 
-    - Shake with some bugfixes.
+    - Appropriately patched copies of all of Shake's dependencies
+      to work with GHC 8.0.  If you wait, these will probably work
+      out; but at the time of writing I needed to pass
+      --allow-newer=base,transformers,process to cabal to get
+      all of the dependencies to install.
 
-Once you've installed that GHC, make two symlinks in this directory, ghc
-and ghc-pkg, which point to the version of GHC you want to use.  If you've
-added that GHC to your path, these commands will do:
+One way to to get everything installed (assuming GHC 8.0 is in your
+path) is to run:
 
-    ln -s `which ghc` ghc
-    ln -s `which ghc-pkg` ghc-pkg
+    git clone https://github.com/ezyang/shake
+    (cd shake && cabal install --allow-newer=base,transformers,process)
+    git clone https://github.com/ezyang/ghc-shake
+    (cd ghc-shake && cabal install --allow-newer=base,transformers,process)
 
-Next, you need to get ghc-shake into your local package database.
-Easiest way is to create a project.cabal that contains the
-projects you want to build as well as ghc-shake.  Then you can say:
-
-    cabal new-build ghc-shake
-    cabal new-build other-project -w ghc-shake
-
-(Assuming ghc-shake is in your path.)
+This will enable usage of `ghc --frontend GhcShake`.  We have a sample
+script 'ghc-shake' in our source directory which you can pass to Cabal
+as a `--with-ghc` argument, which will override the meaning of `--make`
+(however, you'll need to edit the `-plugin-package-db` arguments to
+accurately reflect your installation.  If you're not building ghc-shake
+in place, deleting them should be good enough.)
 
 # What doesn't work
 
-    1. Linking things that are not executables
+    1. Re-linking detection across packages.  See
+        https://ghc.haskell.org/trac/ghc/ticket/10161
 
-    2. Profiling (this is a limitation of GHC's plugins support.)
+    2. Profiling.  See
+        https://ghc.haskell.org/trac/ghc/ticket/11293>
 
-    3. Some odd edge-cases for output files in --make (especially
-    for file targets).
+    3. Linking things that are not executables
+
+    4. Recompilation after package database changes.  (We
+    do correctly pick up changes to external interface
+    files, however.)
+
+    5. ghc-shake is not really lib-ified properly (it
+    should be namespaced and given explicit exports).
+    I'll do this eventually.
 
 If you need something, shout and I'll try to implement it.
-
-# Known recompilation bugs
-
-We reimplement GHC's recompilation avoidance: if GHC would
-have reported, "compilation is NOT necessary", our goal is
-to just skip the module entirely.
-
-There are some bits we haven't gotten around to implementing
-yet:
-
-    - If you change the package database flags / modify
-      the package database, we may fail to pick up the
-      changes which cause different interface files to
-      be loaded.  (However, we WILL pick up changes to
-      the interface files themselves, so long as they
-      are in the same place.)

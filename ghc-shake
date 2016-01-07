@@ -1,8 +1,7 @@
 #!/bin/bash
 ARGS=()
 for var in "$@"; do
-    if [ "$var" != '--make' ]
-    #if true
+    if [[ "$var" != '--make' || -n "$DISABLE_SHAKE" ]]
     then
         ARGS+=("$var")
     else
