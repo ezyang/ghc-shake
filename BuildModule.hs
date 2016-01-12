@@ -4,6 +4,7 @@
 module BuildModule (
     BuildModule(..),
     buildModuleLocation,
+    buildModuleLogPath,
     buildModuleLocations,
     buildModuleRule,
     needBuildModule,
@@ -48,6 +49,14 @@ data BuildModule
 instance Hashable BuildModule
 instance Binary BuildModule
 instance NFData BuildModule
+
+-- | Compute the 'FilePath' which we will log warnings to.
+buildModuleLogPath :: DynFlags -> BuildModule -> FilePath
+buildModuleLogPath dflags (BuildModule file mod is_boot) =
+    let basename = dropExtension file
+        mod_basename = moduleNameSlashes (moduleName mod)
+    in dropExtension (mkHiPath dflags basename mod_basename) <.>
+            (if is_boot then "log-boot" else "log")
 
 -- | Compute the 'ModLocation' for a 'BuildModule'.
 buildModuleLocation :: DynFlags -> BuildModule -> ModLocation

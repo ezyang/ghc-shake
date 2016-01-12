@@ -46,6 +46,7 @@ import Control.Exception
 import System.Environment
 import System.FilePath
 import System.Exit
+import System.IO
 
 frontendPlugin :: FrontendPlugin
 frontendPlugin = defaultFrontendPlugin {
@@ -61,6 +62,7 @@ frontendPlugin = defaultFrontendPlugin {
 doShake :: [String] -> [(String, Maybe Phase)] -> Ghc ()
 doShake args srcs = do
     -- Fix up DynFlags to correct form
+    liftIO $ putStrLn "Starting GHC"
     dflags0 <- fmap normaliseDynFlags getDynFlags
     _ <- setSessionDynFlags
         -- HACK: ghc --make -fno-code is not supposed to generate any
@@ -231,9 +233,21 @@ doShake args srcs = do
         -- duplicated from linkBinary' in DriverPipeline
         -- depend on libraries in the library paths for relink
         let pkg_deps = map fst . dep_pkgs . mi_deps $ main_iface
-        pkg_lib_paths <- liftIO $ getPackageLibraryPath dflags pkg_deps
-        _libs <- getDirectoryFiles "/" (map (</> "*") pkg_lib_paths)
-        -- TODO: properly check this
+        -- For now, we only accurately handle HS packages
+        pkgs <- liftIO $ getPreloadPackagesAnd dflags pkg_deps
+        forM_ pkgs $ \pkg -> do
+            let libs = packageHsLibs dflags pkg
+                paths0 = libraryDirs pkg
+                pattern n
+                    | staticLink = "lib" ++ n ++ ".a"
+                    | otherwise  = "lib" ++ n ++ ".so"
+                search [] = return ()
+                search (path:paths) = do
+                    forM_ libs $ \lib -> do
+                        b <- doesFileExist (path </> pattern lib)
+                        when b $ need [path </> pattern lib]
+                    search paths
+            search paths0
 
         -- Reimplements link' in DriverPipeline
         let link = case ghcLink dflags of
@@ -265,6 +279,7 @@ doShake args srcs = do
 
         let non_boot_location = buildModuleLocation dflags bm { bm_is_boot = False }
             location = buildModuleLocation dflags bm
+            log_path = buildModuleLogPath dflags bm
         mod' <- liftIO $ addHomeModuleToFinder hsc_env mod_name non_boot_location
         assert (mod == mod') $ return ()
 
@@ -273,6 +288,9 @@ doShake args srcs = do
             mapM_ (needImportedModule False) the_imps
             mapM_ (needImportedModule True) srcimps
 
+        -- Clear the log
+        log_handle <- liftIO $ openFile log_path WriteMode
+
         -- Construct the ModSummary
         src_timestamp <- liftIO $ getModificationUTCTime file
         let hsc_src = if isHaskellSigFilename file
@@ -280,12 +298,17 @@ doShake args srcs = do
                         else if is_boot
                                 then HsBootFile
                                 else HsSrcFile
+
             mod_summary = ModSummary {
                         ms_mod = mod,
                         ms_hsc_src = hsc_src,
                         ms_location = location,
                         ms_hspp_file = hspp_fn,
-                        ms_hspp_opts = dflags',
+                        ms_hspp_opts = dflags'
+                            { log_action = \a b c d e ->
+                                                shakeLogAction log_handle a b c d e >>
+                                                defaultLogAction a b c d e
+                            },
                         ms_hspp_buf = Just buf,
                         ms_srcimps = srcimps,
                         ms_textual_imps = the_imps,
@@ -307,6 +330,8 @@ doShake args srcs = do
                             -- passing SourceModified because we
                             -- reimplemented it
                             SourceModified
+
+        liftIO $ hClose log_handle
 
         -- Track fine-grained dependencies
         needInterfaceUsages dflags (hm_iface hmi)
@@ -596,3 +621,22 @@ guessOutputFile mainModuleSrcPath =
                  "default output name would overwrite the input file; " ++
                  "must specify -o explicitly"
         else name
+
+-- | Logs actions to a custom handle.  Copy-pasted from DynFlags
+shakeLogAction :: Handle -> LogAction
+shakeLogAction h dflags severity srcSpan style msg
+    = case severity of
+      SevOutput      -> printSDoc msg style
+      SevDump        -> printSDoc (msg $$ blankLine) style
+      SevInteractive -> putStrSDoc msg style
+      SevInfo        -> printErrs msg style
+      SevFatal       -> printErrs msg style
+      _              -> do hPutChar h '\n'
+                           printErrs (mkLocMessage severity srcSpan msg) style
+                           -- careful (#2302): printErrs prints in UTF-8,
+                           -- whereas converting to string first and using
+                           -- hPutStr would just emit the low 8 bits of
+                           -- each unicode char.
+    where printSDoc  = defaultLogActionHPrintDoc  dflags h
+          printErrs  = defaultLogActionHPrintDoc  dflags h
+          putStrSDoc = defaultLogActionHPutStrDoc dflags h
