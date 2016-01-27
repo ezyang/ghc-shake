@@ -29,4 +29,4 @@ for var in "$@"; do
         ARGS+=("ghc-shake")
     fi
 done
-exec "$(dirname $(realpath $0))/ghc" "${ARGS[@]}"
+exec "$(dirname $(realpath $0))/ghc" "${ARGS[@]}" $SHAKE_ARGS

@@ -44,6 +44,7 @@ import Data.Tuple
 import Control.Monad
 import Control.Exception
 import System.Environment
+import System.Directory (createDirectoryIfMissing)
 import System.FilePath
 import System.Exit
 import System.IO
@@ -289,6 +290,7 @@ doShake args srcs = do
             mapM_ (needImportedModule True) srcimps
 
         -- Clear the log
+        liftIO $ createDirectoryIfMissing True (takeDirectory log_path)
         log_handle <- liftIO $ openFile log_path WriteMode
 
         -- Construct the ModSummary
