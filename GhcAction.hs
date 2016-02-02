@@ -104,7 +104,7 @@ findExposedPackageModule (mod_name, mb_pkg) = do
 -- location of its interface files.  (This also returns the 'Module' for
 -- consistency; it's expected to be equal to the input.)
 findPackageModule :: Module -> Action (Maybe (ModLocation, Module))
-findPackageModule = askPersistentCache
+findPackageModule = askOracle
 
 -- | The backing implementation of 'findPackageModule', to be passed to
 -- 'addPersistentCache'.
@@ -158,7 +158,7 @@ findPackageModule_ dflags mod pkg_conf =
 -- @findHomeModule@: given a 'ModuleName' find the location of the home
 -- module that implements it.
 findHomeModule :: ModuleName -> Action (Maybe (ModLocation, Module))
-findHomeModule = askPersistentCache
+findHomeModule = askOracle
 
 -- | The backing implementation of 'findHomeModule', to be passed to
 -- 'addPersistentCache'.

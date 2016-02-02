@@ -165,11 +165,12 @@ doShake args srcs = do
     _ <- addOracle (askFileModuleName' file_to_mod_name)
     _ <- addOracle (askModuleNameFile' mod_name_to_file)
     _ <- addOracle (lookupModule' dflags)
-    -- These are cached because GHC caches them.  I don't mind probing
-    -- for this every run but doing a persistent cache lets me avoid
-    -- having to plumb these around.
-    _ <- addPersistentCache (findHomeModule' dflags)
-    _ <- addPersistentCache (findPackageModule' dflags)
+    -- Having these be oracles means that we can properly reflect
+    -- changes to -package flags.
+    _ <- addOracle (findHomeModule' dflags)
+    _ <- addOracle (findPackageModule' dflags)
+    askThisPackage <- fmap ($ ThisPackage ()) . addOracle $
+        \(ThisPackage ()) -> return (thisPackage dflags)
     -- This is cached because we want unchanging builds to apply to this
     _ <- addPersistentCache (askRecompKey' hsc_env)
 
@@ -267,6 +268,9 @@ doShake args srcs = do
 
     buildModuleRule $ \bm@(BuildModule raw_file mod is_boot) -> do
 
+        -- Make sure we rebuild if -this-unit-id changes
+        _ <- askThisPackage
+
         -- This is annoying
         let file = if is_boot then addBootSuffix raw_file else raw_file
         need [file]
@@ -357,6 +361,10 @@ newtype NonHsObjectFiles = NonHsObjectFiles ()
 
 -- | Question type for oracle 'askNonHsObjectPhase'.
 newtype NonHsObjectPhase = NonHsObjectPhase String
+    deriving (Show, Typeable, Eq, Hashable, Binary, NFData)
+
+-- | Question type for oracle 'askThisPackage'.
+newtype ThisPackage = ThisPackage ()
     deriving (Show, Typeable, Eq, Hashable, Binary, NFData)
 
 -- | Remove any "." directory components from paths in 'DynFlags', to
