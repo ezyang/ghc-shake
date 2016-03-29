@@ -24,7 +24,7 @@ library
                        BuildModule
   -- other-extensions:    
   build-depends:       base,
-                       ghc == 7.11.*,
+                       ghc == 8.0.*,
                        shake,
                        containers,
                        binary,

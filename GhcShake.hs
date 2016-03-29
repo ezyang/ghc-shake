@@ -31,9 +31,6 @@ import BuildModule
 import Development.Shake
 import Development.Shake.Classes
 
--- I'm evil!
-import Development.Shake.Core
-
 import Prelude hiding (mod)
 import System.Posix.Signals
 import qualified Data.Map as Map
@@ -289,7 +286,7 @@ doShake args srcs = do
         assert (mod == mod') $ return ()
 
         -- Force the direct dependencies to be compiled.
-        unsafeIgnoreDependencies $ do
+        orderOnlyAction $ do
             mapM_ (needImportedModule False) the_imps
             mapM_ (needImportedModule True) srcimps
 
