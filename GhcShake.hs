@@ -285,10 +285,18 @@ doShake args srcs = do
         mod' <- liftIO $ addHomeModuleToFinder hsc_env mod_name non_boot_location
         assert (mod == mod') $ return ()
 
-        -- Force the direct dependencies to be compiled.
+        -- Generate dependencies on how module lookup works.  If the
+        -- lookup changes we have to rebuild!
+        let findImportedModules =
+                mapM (\(mb_pkg, L _ mn) -> findImportedModule mn mb_pkg)
+        locs     <- findImportedModules the_imps
+        src_locs <- findImportedModules srcimps
+
+        -- Force the direct dependencies to be compiled.  These are
+        -- order only because we have fine-grained tracking too.
         orderOnlyAction $ do
-            mapM_ (needImportedModule False) the_imps
-            mapM_ (needImportedModule True) srcimps
+            mapM_ (needFindResult False) locs
+            mapM_ (needFindResult False) src_locs
 
         -- Clear the log
         liftIO $ createDirectoryIfMissing True (takeDirectory log_path)
