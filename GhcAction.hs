@@ -32,7 +32,6 @@ import Packages ( lookupModuleWithSuggestions )
 
 import GhcShakeInstances ()
 import Compat
-import PersistentCache
 
 import Development.Shake
 import Development.Shake.Classes

@@ -27,6 +27,7 @@ for var in "$@"; do
         ARGS+=("/srv/code/ghc-shake/dist-newstyle/packagedb/ghc-8.0.0.20160204")
         ARGS+=("-plugin-package")
         ARGS+=("ghc-shake")
+        ARGS+=("-Wredundant-constraints")
     fi
 done
 exec "$(dirname $(realpath $0))/ghc" "${ARGS[@]}" $SHAKE_ARGS
