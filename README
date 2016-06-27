@@ -52,7 +52,7 @@ in place, deleting them should be good enough.)
         https://ghc.haskell.org/trac/ghc/ticket/10161
 
     2. Profiling.  See
-        https://ghc.haskell.org/trac/ghc/ticket/11293>
+        https://ghc.haskell.org/trac/ghc/ticket/11293
 
     3. Linking things that are not executables
 
@@ -63,5 +63,9 @@ in place, deleting them should be good enough.)
     5. ghc-shake is not really lib-ified properly (it
     should be namespaced and given explicit exports).
     I'll do this eventually.
+
+    6. hs-boot loops don't work; we don't properly
+    invalidate the EPS when we successfully compile
+    the replacement for an hs file.
 
 If you need something, shout and I'll try to implement it.

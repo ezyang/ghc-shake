@@ -51,6 +51,10 @@ frontendPlugin = defaultFrontendPlugin {
         frontend = doShake
     }
 
+
+-- TODO: stop pulling things in from the EPS; use HPT so that
+-- we can correctly knot tie.
+
 -----------------------------------------------------------------------
 
 -- THE BUILD SYSTEM
@@ -296,7 +300,7 @@ doShake args srcs = do
         -- order only because we have fine-grained tracking too.
         orderOnlyAction $ do
             mapM_ (needFindResult False) locs
-            mapM_ (needFindResult False) src_locs
+            mapM_ (needFindResult True) src_locs
 
         -- Clear the log
         liftIO $ createDirectoryIfMissing True (takeDirectory log_path)
@@ -637,9 +641,9 @@ guessOutputFile mainModuleSrcPath =
                  "must specify -o explicitly"
         else name
 
--- | Logs actions to a custom handle.  Copy-pasted from DynFlags
+-- | Logs actions to a custom handle.  (Mostly) copy-pasted from DynFlags
 shakeLogAction :: Handle -> LogAction
-shakeLogAction h dflags severity srcSpan style msg
+shakeLogAction h dflags _reason severity srcSpan style msg
     = case severity of
       SevOutput      -> printSDoc msg style
       SevDump        -> printSDoc (msg $$ blankLine) style
@@ -647,7 +651,7 @@ shakeLogAction h dflags severity srcSpan style msg
       SevInfo        -> printErrs msg style
       SevFatal       -> printErrs msg style
       _              -> do hPutChar h '\n'
-                           printErrs (mkLocMessage severity srcSpan msg) style
+                           printErrs message style
                            -- careful (#2302): printErrs prints in UTF-8,
                            -- whereas converting to string first and using
                            -- hPutStr would just emit the low 8 bits of
@@ -655,3 +659,5 @@ shakeLogAction h dflags severity srcSpan style msg
     where printSDoc  = defaultLogActionHPrintDoc  dflags h
           printErrs  = defaultLogActionHPrintDoc  dflags h
           putStrSDoc = defaultLogActionHPutStrDoc dflags h
+          -- TODO: print the warning flag if we can
+          message = mkLocMessageAnn Nothing severity srcSpan msg
