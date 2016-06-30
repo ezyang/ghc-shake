@@ -299,8 +299,8 @@ doShake args srcs = do
         -- Force the direct dependencies to be compiled.  These are
         -- order only because we have fine-grained tracking too.
         orderOnlyAction $ do
-            mapM_ (needFindResult False) locs
-            mapM_ (needFindResult True) src_locs
+            void . parallel $ map (needFindResult False) locs
+                           ++ map (needFindResult True) src_locs
 
         -- Clear the log
         liftIO $ createDirectoryIfMissing True (takeDirectory log_path)
